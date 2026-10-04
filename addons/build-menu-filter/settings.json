@@ -1,0 +1,10 @@
+{
+  "armorDurabilityThreshold": 8,
+  "categoryOverrides": {},
+  "toolbarX": null,
+  "toolbarY": 12,
+  "toolbarVisible": true,
+  "defaultSort": "Default",
+  "sortDirection": "desc",
+  "toolbarScale": 1
+}

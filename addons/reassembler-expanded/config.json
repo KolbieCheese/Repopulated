@@ -1,0 +1,24 @@
+{
+  "targetFaction": "auto",
+  "sourceWorkshopIds": ["3240818467", "818042635"],
+  "includeCommandBlocks": false,
+  "reactor": {
+    "width": 80,
+    "generation": 10000,
+    "powerStorage": 30000,
+    "points": 3000,
+    "density": 0.3,
+    "durability": 1.5,
+    "growRate": 8,
+    "explodeDamage": 1500,
+    "explodeRadius": 100
+  },
+  "storage": {
+    "width": 80,
+    "capacity": 30000,
+    "points": 1500,
+    "density": 0.2,
+    "durability": 2,
+    "growRate": 8
+  }
+}

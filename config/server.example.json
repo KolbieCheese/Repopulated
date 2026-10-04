@@ -1,0 +1,19 @@
+{
+  "name": "Repopulated galaxy",
+  "bind": "0.0.0.0",
+  "port": 32913,
+  "webPort": 32914,
+  "discoveryPort": 32915,
+  "savePath": ".runtime/galaxy.json",
+  "manifestPath": ".runtime/manifest.json",
+  "settings": {
+    "maxPlayers": 8,
+    "aiFactions": 7,
+    "factions": [2, 3, 4, 8, 11, 12, 15],
+    "seed": 12345,
+    "friendlyFire": true,
+    "pauseWhenEmpty": true,
+    "sharedExploration": false,
+    "tickRate": 30
+  }
+}

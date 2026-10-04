@@ -1,0 +1,24 @@
+{
+  "type": "runtime-stats",
+  "blocks": [
+    {
+      "id": 800,
+      "mass": 14,
+      "health": 183
+    },
+    {
+      "id": 17000,
+      "mass": 1920,
+      "health": 9600
+    },
+    {
+      "id": 17001,
+      "mass": 1280,
+      "health": 12800
+    }
+  ],
+  "generation": 10300,
+  "powerStorage": 30900,
+  "resources": 30100.001953125,
+  "mass": 3214
+}

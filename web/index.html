@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="repopulated-token" content="__CSRF__"><title>Repopulated • Galaxy browser</title>
+<link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body><main>
+<header><span class="eyebrow">REASSEMBLY MULTIPLAYER PROJECT</span><h1>Repopulated</h1><p>Find a galaxy. Build a faction. Fly together.</p></header>
+<aside class="notice"><strong>Experimental networking build — gameplay adapter missing.</strong>
+Lobbies, discovery, settings and transport are functional. This build does not connect to Reassembly's simulation and cannot provide multiplayer gameplay.</aside>
+<p id="error" role="alert"></p>
+<section><div class="row"><h2>Galaxy browser</h2><button id="discover">Find LAN servers</button></div>
+<form id="probe"><label>Address<input name="host" value="127.0.0.1" required maxlength="253"></label>
+<label>TCP port<input name="port" type="number" value="32913" min="1" max="65535" required></label><button>Add server</button></form>
+<div id="servers" class="cards"><p>No servers added. Scan your LAN or enter a host address.</p></div></section>
+<section><h2>Your faction</h2><form id="join"><label>Address<input name="host" value="127.0.0.1" required></label>
+<label>TCP port<input name="port" type="number" value="32913" required min="1" max="65535"></label>
+<label>Player name<input name="name" value="Pilot" required maxlength="32"></label>
+<label>Base faction ID<input name="faction" type="number" value="8" min="1" required></label>
+<label>Server password<input name="password" type="password" autocomplete="off"></label><button>Join lobby / reconnect</button></form>
+<p>Your active mod manifest must match the host. Reconnect credentials are saved on this computer.</p>
+<button id="forget" class="secondary">Forget identity for entered server</button>
+<p>Use this after a host creates a new session at the same address. Forgetting an identity loses access to its reserved faction.</p>
+<div class="row"><button id="ready">Ready</button><button id="unready" class="secondary">Not ready</button><button id="disconnect" class="secondary">Disconnect</button></div>
+<p id="connection">Disconnected</p><div id="roster"></div>
+<h3>Lobby chat</h3><div id="messages" aria-live="polite"></div><form id="chat"><input name="text" maxlength="500" placeholder="Message your crew" aria-label="Chat message" required><button>Send</button></form></section>
+<section id="hosting" hidden><h2>Host settings</h2><p id="engine"></p><form id="settings">
+<label>Player / human faction slots<input name="maxPlayers" type="number" min="1" max="32" required></label>
+<label>AI factions<input name="aiFactions" type="number" min="0" max="64" required></label>
+<label>Allowed base faction IDs<input name="factions" required></label>
+<label>Galaxy seed<input name="seed" type="number" min="0" max="4294967295" required></label>
+<label>Simulation ticks / second<input name="tickRate" type="number" min="10" max="60" required></label>
+<label class="check"><input name="friendlyFire" type="checkbox">Friendly fire</label>
+<label class="check"><input name="sharedExploration" type="checkbox">Share exploration between players</label>
+<label class="check"><input name="pauseWhenEmpty" type="checkbox">Pause when empty</label><button>Save settings</button></form>
+<div class="row"><button id="start">Start / resume galaxy</button><button id="save" class="secondary">Save session</button></div>
+<p>Settings become locked after a world is created. Each pilot owns a distinct empire, even when pilots choose the same base faction.</p></section>
+<footer>Repopulated 0.1 • Unofficial project • LAN discovery and direct connections • No public master server</footer>
+</main></body></html>

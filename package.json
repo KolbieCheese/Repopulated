@@ -1,0 +1,13 @@
+{
+  "name": "repopulated",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental Reassembly multiplayer transport and hosting; native game adapter pending",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node bin/repopulated.js",
+    "test": "node --test",
+    "inspect": "python tools/inspect_install.py"
+  }
+}

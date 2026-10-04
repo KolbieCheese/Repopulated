@@ -1,0 +1,11 @@
+research/
+__pycache__/
+*.dll
+*.pdb
+.venv/
+dist/
+desktop-build/
+desktop-dist/
+launcher-settings.json
+session.log
+settings.json.tmp
