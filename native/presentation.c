@@ -11,9 +11,83 @@ _Static_assert(sizeof(struct VisualProjectile)==36,"wire projectile layout");
 _Static_assert(sizeof(struct VisualThrust)==44,"wire thrust layout");
 typedef void (*NativeThrust)(void*,uint64_t,uint64_t,float,unsigned,uint64_t,float,unsigned);
 static NativeThrust original_thrust;
+#include "thrust_audit.h"
+static uintptr_t native_mover(uintptr_t block,uintptr_t cluster);
+static struct ReplicaThrustAuditContext replica_thrust_audit_begin(uintptr_t block){
+    struct ReplicaThrustAuditContext previous=replica_thrust_audit_context;
+    replica_thrust_audit_context=(struct ReplicaThrustAuditContext){0};
+    unsigned ident=(unsigned)InterlockedCompareExchange(&replica_thrust_audit_ident,0,0);
+    if(!ident)return previous;
+    uintptr_t owner,root,parent;unsigned bid;
+    if(!read_mem((void*)(block+0xb8),&owner,8) || !owner || !read_mem((void*)(block+0x30),&bid,4) || !bid)return previous;
+    root=owner;
+    for(int depth=0;;depth++){
+        if(depth>=16 || !read_mem((void*)(root+0x178),&parent,8))return previous;
+        if(!parent)break;root=parent;
+    }
+    if(RepopulatedClusterIdent((void*)root)!=ident)return previous;
+    uintptr_t mover=native_mover(block,owner);if(!mover)return previous;
+    replica_thrust_audit_context=(struct ReplicaThrustAuditContext){root,block,owner,mover,ident,bid};
+    return previous;
+}
+static void replica_thrust_audit_record(void *system,uint64_t pos,uint64_t vel,float size,unsigned color,uint64_t vel2,float size2,unsigned color2){
+    struct ReplicaThrustAuditContext c=replica_thrust_audit_context;if(!c.root)return;
+    InterlockedIncrement64(&replica_thrust_audit_queue.total);
+    double state[4],row[REPLICA_THRUST_AUDIT_STRIDE]={0};float raw_angle,render[2],render_angle,sim_time,dt,mover[6];int faction;
+    uintptr_t owner;unsigned bid;
+    if(RepopulatedClusterIdent((void*)c.root)!=c.ident || !read_mem((void*)(c.block+0xb8),&owner,8) || owner!=c.owner ||
+       !read_mem((void*)(c.block+0x30),&bid,4) || bid!=c.block_ident || !read_mem((void*)(c.root+0x30),state,32) ||
+       !read_mem((void*)(c.root+0x60),&raw_angle,4) || !read_mem((void*)(c.root+0xd8),render,8) ||
+       !read_mem((void*)(c.root+0xe8),&render_angle,4) || !read_mem((char*)system+0xe4,&sim_time,4) ||
+       !read_mem((char*)GetModuleHandleW(NULL)+0x3cf6a8,&dt,4) || !read_mem((void*)(c.mover+0x1c),mover,sizeof(mover)) ||
+       !read_mem((void*)(c.root+0x118),&faction,4) || RepopulatedClusterIdent((void*)c.root)!=c.ident){replica_thrust_audit_drop();return;}
+    union{uint64_t packed;float xy[2];}p={.packed=pos},v={.packed=vel},v2={.packed=vel2};
+    row[0]=replica_now_millis();row[1]=c.ident;row[2]=c.block_ident;row[3]=sim_time;row[4]=dt;
+    for(int i=0;i<4;i++)row[5+i]=state[i];row[9]=raw_angle;
+    row[10]=render[0];row[11]=render[1];row[12]=render_angle;
+    row[13]=p.xy[0];row[14]=p.xy[1];row[15]=v.xy[0];row[16]=v.xy[1];row[17]=size;row[18]=color;
+    row[19]=v2.xy[0];row[20]=v2.xy[1];row[21]=size2;row[22]=color2;
+    row[23]=mover[0];row[24]=mover[5];row[25]=mover[3];row[26]=mover[4];row[27]=faction;
+    for(int i=0;i<REPLICA_THRUST_AUDIT_STRIDE;i++)if(!isfinite(row[i])){replica_thrust_audit_drop();return;}
+    InterlockedExchangePointer(&replica_thrust_audit_system,system);
+    replica_thrust_audit_append(row);
+}
+__declspec(dllexport) int RepopulatedConfigureThrustAudit(unsigned ident,bool audit_only){
+    initialize();if(!compatible)return -1;return replica_thrust_audit_configure(ident,audit_only);
+}
+__declspec(dllexport) int RepopulatedReadThrustAudit(double *rows,int capacity,double *stats){return replica_thrust_audit_read(rows,capacity,stats);}
+typedef void (*ParticleRenderAuditOriginal)(void*,void*,void*,float);
+static ParticleRenderAuditOriginal particle_render_audit_original;
+__declspec(dllexport) void RepopulatedSetParticleRenderAuditOriginal(void *address){memcpy(&particle_render_audit_original,&address,sizeof(address));}
+static void replica_particle_render_capture(void *system,void *state,void *view,float time){
+    if(system!=InterlockedCompareExchangePointer(&replica_thrust_audit_system,NULL,NULL))return;
+    InterlockedIncrement64(&replica_particle_audit.calls);
+    float viewport[18],to_pixels,sim_time;uintptr_t vectors[6];int step,max_particles,verts;
+    bool readable=read_mem(view,viewport,sizeof(viewport)) && read_mem((char*)state+0x44,&to_pixels,4) &&
+        read_mem((char*)system+8,vectors,sizeof(vectors)) && read_mem((char*)system+0xe0,&step,4) &&
+        read_mem((char*)system+0xe4,&sim_time,4) && read_mem((char*)system+0xe8,&max_particles,4) && read_mem((char*)system+0x5c,&verts,4);
+    double denom=readable?(double)viewport[8]*viewport[2]-viewport[9]:0;
+    if(!readable || !isfinite(to_pixels) || to_pixels<=0 || !isfinite(time) || !isfinite(sim_time) ||
+       !isfinite(denom) || denom<=0 || viewport[0]<=0 || viewport[1]<=0 || viewport[2]<=0 || viewport[3]<=0 ||
+       vectors[1]<vectors[0] || vectors[2]<vectors[1] || (vectors[1]-vectors[0])%0x30 ||
+       vectors[4]<vectors[3] || vectors[5]<vectors[4] || (vectors[4]-vectors[3])%0x30 ||
+       vectors[2]-vectors[0]>10000000*0x30ULL || vectors[5]-vectors[3]>10000000*0x30ULL ||
+       step<0 || max_particles<0 || max_particles>10000000 || verts<1 || verts>4){InterlockedIncrement64(&replica_particle_audit.dropped);return;}
+    double row[18]={replica_now_millis(),to_pixels,viewport[8],viewport[9],viewport[0],viewport[1],viewport[2],viewport[3],
+        time,sim_time,step,(double)((vectors[4]-vectors[3])/0x30)/(double)verts,(double)((vectors[1]-vectors[0])/0x30),max_particles,verts,0,0,
+        (double)viewport[0]/denom};
+    for(int i=0;i<18;i++)if(!isfinite(row[i])){InterlockedIncrement64(&replica_particle_audit.dropped);return;}
+    replica_particle_audit_store(row);
+}
+__declspec(dllexport) void RepopulatedAuditParticleRender(void *system,void *state,void *view,float time){
+    if(!particle_render_audit_original)return;
+    replica_particle_render_capture(system,state,view,time);
+    particle_render_audit_original(system,state,view,time);
+}
+__declspec(dllexport) int RepopulatedReadParticleRenderAudit(double *out){return replica_particle_audit_read(out);}
 static SRWLOCK thrust_lock=SRWLOCK_INIT;
 static struct VisualThrust captured_thrust[4096];
-static ULONGLONG captured_ticks[4096];
+static double captured_ticks[4096];
 static unsigned captured_count,captured_dropped;
 static struct VisualProjectile replica_projectiles[2048];
 static struct VisualBlock replica_blocks[4096];
@@ -21,7 +95,12 @@ static int replica_block_count;
 static struct VisualThrust replica_thrust[512];
 static int replica_projectile_count,replica_thrust_count,replica_thrust_next;
 static void *presentation_zone;
-static ULONGLONG presentation_tick;
+static double presentation_tick;
+static bool presentation_source_clock;
+static double presentation_age_millis(double now){
+    double target=presentation_source_clock?replica_source_view_time(now,replica_motion_clock_offset,replica_presentation_delay):now-replica_presentation_delay;
+    return fmax(0,target-presentation_tick);
+}
 static unsigned long long replayed_thrust,drawn_projectiles,applied_turrets,applied_lasers,rendered_beams;
 static unsigned long long beam_zones,beam_components,beam_matches,beam_active_sources;
 static char presentation_message[256];
@@ -65,13 +144,16 @@ static bool presentation_functions(NativeThrust *thrust) {
 }
 __declspec(dllexport) void RepopulatedSetThrustOriginal(void *address) { memcpy(&original_thrust,&address,sizeof(address)); }
 __declspec(dllexport) void RepopulatedCaptureThrust(void *system,uint64_t pos,uint64_t vel,float size,unsigned color,uint64_t vel2,float size2,unsigned color2) {
+    replica_thrust_audit_record(system,pos,vel,size,color,vel2,size2,color2);
     union {uint64_t packed;float xy[2];} p={.packed=pos},v={.packed=vel},v2={.packed=vel2};
+    if(!InterlockedCompareExchange(&replica_thrust_audit_only,0,0)){
     AcquireSRWLockExclusive(&thrust_lock);
     if(captured_count<4096) {
         captured_thrust[captured_count]=(struct VisualThrust){p.xy[0],p.xy[1],v.xy[0],v.xy[1],size,color,v2.xy[0],v2.xy[1],size2,color2,0};
-        captured_ticks[captured_count++]=GetTickCount64();
+        captured_ticks[captured_count++]=replica_now_millis();
     } else captured_dropped++;
     ReleaseSRWLockExclusive(&thrust_lock);
+    }
     if(original_thrust) original_thrust(system,pos,vel,size,color,vel2,size2,color2);
 }
 static bool near_focus(double x,double y,const double *focus,float radius) {
@@ -79,7 +161,7 @@ static bool near_focus(double x,double y,const double *focus,float radius) {
 }
 __declspec(dllexport) int RepopulatedExportPresentation(void *zone,const char *path,unsigned focus,float radius) {
     initialize();NativeThrust unused;
-    if(!compatible || !zone || !path || !focus || !isfinite(radius) || radius<100 || radius>10000 || !presentation_functions(&unused)) return -1;
+    if(!compatible || !zone || !path || !focus || !isfinite(radius) || radius<100 || radius>20000 || !presentation_functions(&unused)) return -1;
     uintptr_t vector[2];double center[2];bool found=false;
     if(!read_mem((char*)zone+0x188,vector,16) || vector[1]<vector[0] || (vector[1]-vector[0])%8 || vector[1]-vector[0]>4096*8) return -2;
     for(size_t i=0;i<(vector[1]-vector[0])/8;i++) {
@@ -153,7 +235,7 @@ __declspec(dllexport) int RepopulatedExportPresentation(void *zone,const char *p
         fprintf(file,"[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%u,%.9g]",pose[0],pose[1],pose[2],pose[3],record.angle,record.size,record.ttl,record.color,record.health);
     }
     fputs("],\"thrust\":[",file);
-    ULONGLONG now=GetTickCount64(),first=now;
+    double now=replica_now_millis(),first=now;
     AcquireSRWLockExclusive(&thrust_lock);
     for(unsigned i=0;i<captured_count;i++)if(now-captured_ticks[i]<=300 && near_focus(captured_thrust[i].x,captured_thrust[i].y,center,radius)) {first=captured_ticks[i];break;}
     unsigned eligible=0,visited=0,selected=0;
@@ -173,23 +255,43 @@ __declspec(dllexport) int RepopulatedExportPresentation(void *zone,const char *p
     ReleaseSRWLockExclusive(&thrust_lock);
     if(fclose(file))return -9;return error?error:block_count+projectile_count+thrust_count;
 }
-__declspec(dllexport) int RepopulatedApplyPresentation(void *zone,const struct VisualBlock *records,int count,const struct VisualProjectile *shots,int shot_count,const struct VisualThrust *thrust,int thrust_count) {
+static bool realtime_presentation;
+struct VisualReference { unsigned ident,bid,type;uintptr_t block; };
+static struct VisualReference visual_references[65536];
+static int compare_visual_reference(const void *a,const void *b){
+    unsigned x=((const struct VisualReference*)a)->bid,y=((const struct VisualReference*)b)->bid;
+    return (x>y)-(x<y);
+}
+static int apply_presentation(void *zone,const struct VisualBlock *records,int count,const struct VisualProjectile *shots,int shot_count,const struct VisualThrust *thrust,int thrust_count,bool realtime) {
     initialize();NativeThrust unused;
     if(!compatible || !zone || count<0 || count>4096 || shot_count<0 || shot_count>2048 || thrust_count<0 || thrust_count>512 || !presentation_functions(&unused))return -1;
     uintptr_t roots[2];if(!read_mem((char*)zone+0x188,roots,16) || roots[1]<roots[0] || roots[1]-roots[0]>4096*8)return -2;
-    int applied=0;
-    for(size_t i=0;i<(roots[1]-roots[0])/8;i++) {
+    int applied=0,reference_count=0;
+    for(size_t i=0;count && i<(roots[1]-roots[0])/8;i++) {
         uintptr_t cluster,parent,blocks[2];if(!read_mem((void*)(roots[0]+i*8),&cluster,8) || !read_mem((void*)(cluster+0x178),&parent,8))return -3;
         if(parent)continue;unsigned ident=RepopulatedClusterIdent((void*)cluster);
         if(!read_mem((void*)(cluster+0xf0),blocks,16) || blocks[1]<blocks[0] || blocks[1]-blocks[0]>4096*8)return -3;
-        for(int r=0;r<count;r++) {
-            if(records[r].ident!=ident)continue;uintptr_t match=0;
-            for(size_t j=0;j<(blocks[1]-blocks[0])/8;j++) {
-                uintptr_t block;unsigned type,block_ident;
-                if(!read_mem((void*)(blocks[0]+j*8),&block,8) || !read_mem((void*)(block+0x18),&type,4) || !read_mem((void*)(block+0x30),&block_ident,4))return -3;
-                if(type==records[r].type && block_ident==records[r].block_ident){if(match)return -4;match=block;}
+        for(size_t j=0;j<(blocks[1]-blocks[0])/8;j++){
+            uintptr_t block;unsigned char header[48];unsigned type,bid;uint64_t features;
+            if(!read_mem((void*)(blocks[0]+j*8),&block,8) || !read_mem((void*)(block+0x18),header,sizeof(header)))return -3;
+            memcpy(&features,header+0x28,8);if(!(features&0x90))continue;
+            memcpy(&type,header,4);memcpy(&bid,header+0x18,4);if(!bid)continue;
+            if(reference_count==65536)return -3;
+            visual_references[reference_count++]=(struct VisualReference){ident,bid,type,block};
+        }
+    }
+    qsort(visual_references,reference_count,sizeof(visual_references[0]),compare_visual_reference);
+    for(int r=0;r<count;r++) {
+            unsigned ident=records[r].ident;uintptr_t match=0;
+            int lo=0,hi=reference_count;while(lo<hi){int mid=lo+(hi-lo)/2;if(visual_references[mid].bid<records[r].block_ident)lo=mid+1;else hi=mid;}
+            if(lo<reference_count && visual_references[lo].bid==records[r].block_ident){
+                if(lo+1<reference_count && visual_references[lo+1].bid==records[r].block_ident)return -4;
+                if(visual_references[lo].ident==ident && visual_references[lo].type==records[r].type)match=visual_references[lo].block;
             }
             if(!match) {
+                /* The small state stream can precede a new geometry frame.
+                 * Never attach its state to a different native block. */
+                if(realtime)continue;
                 snprintf(presentation_message,sizeof(presentation_message),"Missing visual block entity=%u type=%u xy=(%.9g,%.9g) angle=%.9g",ident,records[r].type,records[r].x,records[r].y,records[r].angle);
                 return -5;
             }
@@ -211,31 +313,44 @@ __declspec(dllexport) int RepopulatedApplyPresentation(void *zone,const struct V
                 *(unsigned char*)(match+0xf0)|=2;applied_lasers++;
             }
             applied++;
-        }
     }
-    if(applied!=count)return -7;
+    if(!realtime && applied!=count)return -7;
     memcpy(replica_blocks,records,(size_t)count*sizeof(*records));replica_block_count=count;
     memcpy(replica_projectiles,shots,(size_t)shot_count*sizeof(*shots));replica_projectile_count=shot_count;
     memcpy(replica_thrust,thrust,(size_t)thrust_count*sizeof(*thrust));replica_thrust_count=thrust_count;replica_thrust_next=0;
-    presentation_zone=zone;presentation_tick=GetTickCount64();return applied;
+    realtime_presentation=realtime;presentation_zone=zone;
+    presentation_source_clock=realtime && replica_motion_clock_ready;
+    presentation_tick=presentation_source_clock?(replica_visual_clock_ready?replica_visual_source_at:replica_motion_source_at):
+        realtime && replica_motion_sequence?replica_motion_sampled_at:replica_now_millis();return applied;
+}
+__declspec(dllexport) int RepopulatedApplyPresentation(void *zone,const struct VisualBlock *records,int count,const struct VisualProjectile *shots,int shot_count,const struct VisualThrust *thrust,int thrust_count) {
+    return apply_presentation(zone,records,count,shots,shot_count,thrust,thrust_count,false);
+}
+__declspec(dllexport) int RepopulatedApplyRealtimePresentation(void *zone,const struct VisualBlock *records,int count,const struct VisualProjectile *shots,int shot_count,const struct VisualThrust *thrust,int thrust_count) {
+    return apply_presentation(zone,records,count,shots,shot_count,thrust,thrust_count,true);
 }
 __declspec(dllexport) int RepopulatedTickPresentation(void *zone) {
     if(zone!=presentation_zone)return 0;
-    float elapsed=(float)(GetTickCount64()-presentation_tick)/1000;
+    float elapsed=(float)presentation_age_millis(replica_now_millis())/1000;
     if(elapsed>0.5f){replica_thrust_next=replica_thrust_count;return 0;}
     NativeThrust emit;if(!presentation_functions(&emit))return -1;
     void *system;if(!read_mem(zone,&system,sizeof(system)) || !system)return -2;
     int count=0;
     while(replica_thrust_next<replica_thrust_count && replica_thrust[replica_thrust_next].delay<=elapsed) {
         struct VisualThrust *r=replica_thrust+replica_thrust_next++;
-        union{float xy[2];uint64_t packed;} p={.xy={r->x+world_visual_center[0],r->y+world_visual_center[1]}},v={.xy={r->vx,r->vy}},v2={.xy={r->vx2,r->vy2}};
+        /* Realtime events carry their age at the shared motion sample, rather
+         * than starting an old exhaust window again after scene decoding. */
+        float age=realtime_presentation?fmaxf(0,elapsed-r->delay):0;
+        if(age>0.12f)continue;
+        union{float xy[2];uint64_t packed;} p={.xy={r->x+r->vx*age+world_visual_center[0],r->y+r->vy*age+world_visual_center[1]}},v={.xy={r->vx,r->vy}},v2={.xy={r->vx2,r->vy2}};
         emit(system,p.packed,v.packed,r->size,r->color,v2.packed,r->size2,r->color2);count++;replayed_thrust++;
     }
     return count;
 }
 __declspec(dllexport) int RepopulatedDrawReplicaProjectiles(void *zone) {
     if(zone!=presentation_zone)return 0;
-    float elapsed=(float)(GetTickCount64()-presentation_tick)/1000;if(elapsed>0.3f)return 0;
+    float wall_elapsed=(float)presentation_age_millis(replica_now_millis())/1000;if(wall_elapsed>0.3f)return 0;
+    float elapsed=wall_elapsed*(realtime_presentation?(float)replica_simulation_clock.rate:1);
     typedef void (*Append)(void*,const void*);Append append;uintptr_t address=(uintptr_t)GetModuleHandleW(NULL)+0x171400;memcpy(&append,&address,8);
     int count=0;
     for(int i=0;i<replica_projectile_count;i++) {
@@ -247,7 +362,7 @@ __declspec(dllexport) int RepopulatedDrawReplicaProjectiles(void *zone) {
     return count;
 }
 __declspec(dllexport) int RepopulatedRenderReplicaBeams(void *zone,void *mesh,const void *view) {
-    if(zone!=presentation_zone || GetTickCount64()-presentation_tick>300)return 0;
+    if(zone!=presentation_zone || presentation_age_millis(replica_now_millis())>300)return 0;
     beam_zones++;
     HMODULE game=GetModuleHandleW(NULL);
     const char *name="?renderEffect@Block@@QEBAXAEAU?$TriMesh@UVertexPosColorLuma@@@@AEBUView@@@Z";

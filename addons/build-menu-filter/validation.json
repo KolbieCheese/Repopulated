@@ -45,12 +45,44 @@
     "graphical Play button to bundled backend to isolated game",
     "GUI preference save/reset",
     "GUI rejects invalid executable",
-    "no console window in packaged launcher"
+    "no console window in packaged launcher",
+    "exact Steam null-read startup regression reproduced and fixed",
+    "Steam-enabled full filtering/sorting/layout regression",
+    "Steam remote storage read-only save-slot visibility",
+    "both copied campaign slots loaded through native continue path",
+    "copied Mother-Ship campaign builder with 1313 parts",
+    "original Steam saves and mod index SHA256 unchanged",
+    "Steam failure stops before empty local save list",
+    "packaged GUI Play button with real Steam and early callback regression"
   ],
   "reassemblerRequired": false,
   "repositoryRequired": false,
-  "userCampaignTested": false,
+  "userCampaignTested": true,
   "multiplayerCoexistenceTested": false,
   "desktopPlayExitCode": 0,
-  "desktopConsoleWindow": 0
+  "desktopConsoleWindow": 0,
+  "version": "1.1",
+  "steamStartup": {
+    "exactCrashReproducedRva": "0x489f9",
+    "earlyStatsRequestWithSlowLoader": true,
+    "callbackTableGuardPassed": true,
+    "productionSteamFailureHandled": true,
+    "steamFilesVisible": 27,
+    "existingSaveSlotsVisible": [
+      0,
+      1
+    ],
+    "desktopSteamPlayExitCode": 0
+  },
+  "campaignValidation": {
+    "copiedProfilesOnly": true,
+    "nativeContinueSlots": [
+      0,
+      1
+    ],
+    "motherShipBuilderParts": 1313,
+    "originalSteamAndModFilesSha256Unchanged": true,
+    "cloudWritesDisabledForTestsOnly": true,
+    "originalCampaignWritesTested": false
+  }
 }

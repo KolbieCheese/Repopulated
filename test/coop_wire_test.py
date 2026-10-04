@@ -1,21 +1,32 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
-from coop_wire import snapshot,decode_snapshot,control,PILOT
+from coop_wire import snapshot,decode_snapshot,control,PILOT,coalesce_inputs
+from replica_plan import ReplicaPlan,HEADER
+from scene_codec import Reader
 
 SCENE=b'cluster{position={12,34},blocks={{800,command={ident=0x70000002,faction=20008}}}}'
 
 
 class CoopWireTests(unittest.TestCase):
+    def test_unsent_press_survives_newer_movement_and_aim(self):
+        previous={'action':'native','seq':1,'dimensions':8,'weapons':[[123,64,100,0,0,0,0,1.2],[456,32,100,0,0,0,0,0]]}
+        latest={'action':'native','seq':2,'dimensions':260,'weapons':[[123,0,200,0,0,0,0,0.5],[789,0,200,0,0,0,0,0]]}
+        combined=coalesce_inputs([previous],[latest])[0]
+        self.assertEqual(combined['seq'],2);self.assertEqual(combined['dimensions'],260)
+        self.assertEqual(combined['weapons'],[[123,64,200,0,0,0,0,0.5],[789,0,200,0,0,0,0,0]])
+        self.assertEqual(latest['weapons'][0][1],0)
+
     def test_native_navigation_preserves_rotation_and_server_ownership(self):
         message={'type':'input','seq':1,'action':'native','dimensions':8,'destination':[0,0,0,0,0,-2],
-                 'precision':[10,10,0.01,0.01],'weapons':[[123,32,1000,0,0,0,0]]}
+                 'precision':[10,10,0.01,0.01],'weapons':[[123,32,1000,0,0,0,0,1.2]],'viewRadius':5000,'clientTick':12}
         result=control(message,0)
         self.assertEqual(result['destination'][-1],-2);self.assertEqual(result['ownerFaction'],20008)
         for patch in ({'ownerFaction':100},{'dimensions':True},{'dimensions':0x200},
                       {'destination':[0,0,0,0,float('nan'),0]},{'precision':[-1,10,0.01,0.01]},
-                      {'weapons':[[123,1,1000,0,0,0,0]]},{'weapons':message['weapons']*2},{'seq':0}):
+                      {'weapons':[[123,1,1000,0,0,0,0,0]]},{'weapons':message['weapons']*2},{'viewRadius':20001},{'viewRadius':True},{'viewRadius':float('nan')},{'clientTick':True},{'clientTick':-1},{'seq':0}):
             with self.subTest(patch=patch):
                 with self.assertRaises(ValueError):control(dict(message,**patch),0)
 
@@ -26,6 +37,16 @@ class CoopWireTests(unittest.TestCase):
         self.assertEqual(pose,[12,34,0,0,0])
         encoded,encoded_pose=snapshot(SCENE,1,1,with_pose=True)
         self.assertEqual(encoded,message);self.assertEqual(encoded_pose,pose)
+
+    def test_validated_scene_is_parsed_once_for_incremental_apply(self):
+        data=SCENE.replace(b'command=',b'persistentIdent=123,command=')
+        message=snapshot(data,1,1);planner=ReplicaPlan(HEADER)
+        with patch('replica_plan.Reader',wraps=Reader) as reader:
+            decoded,pose,parsed=decode_snapshot(message,0,planner.read_with_shapes)
+            plan=planner.prepare(decoded,parsed)
+            self.assertEqual(reader.call_count,1)
+        self.assertEqual(pose,[12,34,0,0,0]);self.assertEqual(plan['replaced'],1)
+        with self.assertRaises(ValueError):decode_snapshot(dict(message,roots=2),0,planner.read_with_shapes)
 
     def test_reordered_fragment_tag_is_preserved(self):
         data=SCENE+b'cluster{blocks={{803,{0,0}},{803,{10,0},persistentIdent=1234}}}'

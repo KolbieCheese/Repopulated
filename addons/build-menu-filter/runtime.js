@@ -400,6 +400,16 @@ function captureFrame(){
     }
 }
 rpc.exports = {
+  steamstatus() {
+    if(!cfg.testing)throw Error('Test-only operation');
+    if(startupSteam!==true)return {initialized:false};
+    const api=Process.getModuleByName('steam_api64.dll');
+    const storage=new NativeFunction(api.getExportByName('SteamAPI_SteamRemoteStorage_v016'),'pointer',[])();
+    const exists=new NativeFunction(api.getExportByName('SteamAPI_ISteamRemoteStorage_FileExists'),'bool',['pointer','pointer']);
+    const count=new NativeFunction(api.getExportByName('SteamAPI_ISteamRemoteStorage_GetFileCount'),'int',['pointer']);
+    return {initialized:true,callbacksReady:startupReady,fileCount:count(storage),
+      saveSlots:[0,1,2].map(slot=>exists(storage,Memory.allocUtf8String('data/save'+slot+'/save.lua')))};
+  },
   setfilter(value) {
     if (!FilterModel.categories.includes(value.category) || typeof value.query !== 'string' || typeof value.source !== 'string') throw Error('Invalid filter');
     category=value.category;query=value.query.slice(0,80);source=value.source;pending=true;return true;
@@ -412,7 +422,7 @@ rpc.exports = {
     if(!cfg.testing||!active)throw Error('Test-only operation');
     return readIds(active.palette.add(0x2b8).readPointer()).map(id=>getMetadata(id));
   },
-  status() { return {category,source,query,typing,visible,metric,direction,geometry,cursorFrames,frames,failures,active:!!active,total:active?active.ids.length:0,shown:active?active.shown:0}; }
+  status() { return {category,source,query,typing,visible,metric,direction,pending,geometry,cursorFrames,frames,failures,active:!!active,total:active?active.ids.length:0,shown:active?active.shown:0}; }
   ,capture(name) { if(!cfg.testing)throw Error('Test-only operation');captureRequested=String(name);return true; }
   ,testevent(value) {
     if(!cfg.testing||!hooksReady)throw Error('Test-only operation');

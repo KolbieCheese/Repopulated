@@ -1,4 +1,4 @@
-# Native multiplayer evening test — October 3, 2026
+# Native multiplayer test — October 4, 2026
 
 Extract the updated `Repopulated-Multiplayer-Alpha.zip` on **both Windows PCs**.
 Run `Repopulated Multiplayer.exe` with its `_internal` folder beside it. Select
@@ -14,6 +14,11 @@ address, port and token. Leave **Native campaign controls and HUD** checked,
 choose an initial rotation mode, and click **Join game**. Use the same native
 game controls you normally use. Each PC runs its own installed game; the host
 alone simulates the shared world.
+
+This build uses a 100 ms presentation buffer to smooth the client's movement
+and align its weapon/damage visuals. Expect some visible response delay while
+immediate local input replay remains disabled. Both launchers must use native
+protocol 7; update both together.
 
 ## Flight and combat
 

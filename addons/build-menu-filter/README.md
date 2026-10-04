@@ -1,11 +1,11 @@
-# Reassembly Build Menu Filters
+# Reassembly Build Menu Filters — 1.1
 
 A standalone Windows native extension that adds a filter toolbar to the ship constructor. Works with vanilla Reassembly and modded factions. Reassembler, Reassembler Expanded, and the multiplayer mod are not required. It filters the existing available palette; it does not unlock technology or import ships.
 
 ## Run
 
 1. Extract the entire ZIP into a folder of your choice. This is a native extension, so putting it in the game's `mods` directory alone does not activate it.
-2. Close Reassembly and keep Steam running if you normally play through Steam.
+2. Close Reassembly and keep Steam running and signed in.
 3. Double-click **Reassembly Filters.exe**. Select the game executable with Browse if it was not detected automatically.
 4. Click **PLAY REASSEMBLY**, open your save, and enter the ship builder as usual.
 
@@ -14,6 +14,14 @@ The desktop download includes its private Python/Tk/Frida runtime. Players do no
 You may close the launcher while playing; its background worker continues until the game exits. Exit Reassembly normally to save your work. Launching through Steam alone does not load the extension. Closing the game and launching it normally removes the extension for that session.
 
 The launcher finds Reassembly in Steam library folders automatically and remembers the game path you select. This folder contains its own data parser and requires no repository checkout. `Open Launcher.vbs` is an alternate console-free entry point. Source-checkout users without the packaged executable can install 64-bit Python 3.11 or newer, run Setup.cmd once, then double-click Open Launcher.vbs. Launch Filters.cmd remains an optional diagnostic command-line entry point.
+
+## Updating from the first download
+
+Extract **Reassembly-Build-Menu-Filters-1.1.zip** into a new folder and run the executable from that folder. The old extracted launcher contains the startup bug. You can copy your old `settings.json` into the new folder to retain toolbar preferences. Your game saves and enabled mod order stay in Reassembly's existing Steam/profile locations; there is no save migration or reset.
+
+Version 1.1 fixes a Steam startup race: the game's callback thread could retrieve statistics before its statistics and achievement tables existed, producing a null-read crash at RVA `0x489f9`. The extension now waits for both tables before draining queued Steam callbacks. Steam, Workshop, and Cloud remain enabled in ordinary play. If Steam cannot initialize, the launcher reports the failure and stops before presenting an empty local save list. The launcher's running status also waits for the initialization check.
+
+If saves appear missing, close the game, start Steam and sign in to your usual account, then use this updated launcher. Do not create replacement saves or change your mod order to recover them. Open **View session log** if startup still fails; Reassembly's own latest log is in `%USERPROFILE%\Saved Games\Reassembly\data\log_latest.txt`.
 
 ## Controls
 
@@ -56,9 +64,13 @@ This first version supports the installed July 2025 Windows x64 executable, SHA2
 
 The extension uses process-local Frida hooks and an OpenGL toolbar. It does not patch the executable on disk. It maintains a separate displayed-ID vector and verifies that the original available-ID list stays unchanged. Filtering pauses while dragging. Edit Palette receives the original list; returning to construction reapplies the filter. A detected runtime error disables filtering for that process and attempts to restore the original palette.
 
-Automated live tests use hidden windows, fresh redirected profiles, disabled Steam/network, and bounded lifetimes. They cover stock Terran and expanded Reassembler palettes, all numeric sorts in both directions, missing stats last, filtered sorting, keyboard and mouse filtering/sorting, source selection, empty results, reset, showing/hiding, and entering/leaving Edit Palette. The actual displayed ID vector is read back to verify ordering. Custom reactor/vault stats are checked against their exact expected values. Native cursor layering, dragging, resizing, scaled clicks, centered reset, and layout persistence were also checked. The extracted desktop executable and its Play-button workflow passed using the bundled runtime without an external Python installation or console window. Screenshots were checked visually. The user's campaign has not been opened by these tests. Multiplayer coexistence has not yet been tested; implementation files are separate and findings have been shared with that agent.
+Automated live tests use fresh redirected profiles and bounded lifetimes. They cover stock Terran and expanded Reassembler palettes, all numeric sorts in both directions, missing stats last, filtered sorting, keyboard and mouse filtering/sorting, source selection, empty results, reset, showing/hiding, and entering/leaving Edit Palette. The actual displayed ID vector is read back to verify ordering. Custom reactor/vault stats are checked against their exact expected values. Native cursor layering, dragging, resizing, scaled clicks, centered reset, and layout persistence were also checked. The extracted desktop executable and its Play-button workflow passed using the bundled runtime without an external Python installation or console window.
+
+Steam-enabled regression tests explicitly request statistics early and slow the native loader. This reproduces the original null read without the guard and succeeds with it. These tests disable Cloud writes with `kSteamCloudEnable=0` in their private profile only. A copied existing campaign was loaded through the native save-slot path with its original mod index, and its Mother-Ship builder opened with 1,313 parts. Original Steam save and mod-index files passed before/after SHA256 checks. Screenshots were checked visually. Multiplayer coexistence has not yet been tested; implementation files are separate and findings have been shared with that agent.
 
 Run `.venv\Scripts\python.exe launch.py --test --no-provenance` for a vanilla isolated test, or add `--addon-test` without `--no-provenance` to test the optional installed expanded faction. The optional integration reads its existing build report and provenance registry; it does not import its Python code or require it for vanilla use. Classification tests in the source checkout run with `node --test model.test.js`.
+
+Add `--steam-test` to `--test` for the real Steam startup regression and full palette checks in a fresh profile with Cloud disabled. The packaged GUI supports `Reassembly Filters.exe --self-test report.json --steam-test` for the corresponding Play-button regression.
 
 ## Package contents
 
@@ -66,4 +78,4 @@ Run `.venv\Scripts\python.exe launch.py --test --no-provenance` for a vanilla is
 
 Developers can rebuild the desktop runtime and ZIP with `python build_desktop.py` after installing PyInstaller 6. The packaging script can update the ZIP without rebuilding the desktop runtime. Research utilities and generated test profiles are excluded from the download.
 
-Native entry points and offsets are recorded in `signatures.json`, `runtime.js`, and the read-only research utilities. Generated test profiles and disassembly stay under ignored `research/`.
+Native entry points and offsets are recorded in `signatures.json`, `startup.js`, `runtime.js`, and the read-only research utilities. Generated test profiles and disassembly stay under ignored `research/`.

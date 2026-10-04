@@ -42,9 +42,17 @@ still need physical and visual parity tests.
 
 ## Presentation fidelity
 
-A bounded version-1 stream carries weapon block IDs, turret angle, laser firing
-and render endpoints, nearby ordinary projectile pose/size/color/TTL, and native
-thrust events. The client invokes the stock particle and weapon render paths
+A bounded native protocol-7 state stream carries ship motion, weapon block IDs,
+turret angle, laser firing/endpoints, nearby ordinary projectile state, block
+health/growth/lifetime, and native mover throttle values from one game update.
+It carries both wall and simulation timestamps: native velocities are measured
+per simulation second. Presentation accounts for their measured clock ratio.
+World snapshot validation and planning run in separate processes so large Lua
+scenes do not starve fast-state delivery.
+The client generates exhaust locally through Block::moverUpdate (0xf09e0) and
+the stock particle system. Particles are not transmitted. Its exhaust emitter
+uses the same render correction as the source ship, preserving attachment while
+authoritative poses change. The client invokes the stock weapon render paths
 without running local weapon, collision, or damage simulation. Persistent
 weapon block IDs are necessary: level expansion can recenter local block
 coordinates, and respawn/fragmentation invalidates cached pointers.
@@ -52,13 +60,21 @@ coordinates, and respawn/fragmentation invalidates cached pointers.
 This removes several static-ship symptoms but does not reproduce every native
 effect. Add explosions, impacts, charge glows, shields, short-lived effect
 events, and native resource visuals. Verify these visually on both machines.
-Scene delivery remains four Hz. Unchanged clusters persist; pose, health,
+Geometry delivery targets four Hz; state frames target 20 Hz independently.
+Unchanged clusters persist; pose, health,
 resources, energy, growth and lifetime update in place. Deleted or structurally
 changed clusters use native removal/deferred-free and append paths. Structural
 growth, fragmentation and launcher attachments can still replace an affected
-ship. Presentation predicts linear/angular motion for at most 250 ms and fades
-corrections over 100 ms. The client is paced at 60 FPS; longer tests and other
-hardware must establish the actual experience.
+ship. Older geometry cannot rewind retained fast-state poses. Native clients
+default to a 100 ms source-time buffer with Hermite interpolation and wrapped
+angles; missing brackets extrapolate for at most 250 ms, then freeze. The same
+buffer selects health, weapon, projectile and mover presentation. The native
+camera follows that presented pose. The added visible control delay remains
+until verified immediate input replay is enabled. The client is paced at 60 FPS; longer tests and other
+hardware must establish the actual experience. Native local movement prediction
+is implemented experimentally using the mover helper and the game's velocity
+integrator (0x15c6b0); it remains disabled in the regular launcher pending
+hands-on rotation, latency, collision, and correction-quality testing.
 
 ## Persistent campaign client
 

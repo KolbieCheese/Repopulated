@@ -11,16 +11,44 @@ a public server directory, or a dedicated campaign simulator. Native alpha
 save/resume preserves the host campaign and both existing faction ships; full
 remote blueprint libraries and progression are not implemented yet.
 The remote pilot must stay within the area loaded by the host. A separate
-presentation stream now carries native thruster particles, ordinary projectile
-trails, turret rotation, and beam firing/endpoints. The client uses the game's
-particle system and weapon renderers; it does not simulate damage or projectiles.
+state stream now carries ordinary projectile trails, turret rotation, beam
+firing/endpoints, runtime damage, and thruster control values alongside ship
+motion, with host wall-clock and simulation-clock timestamps. The client generates exhaust every local game update through the
+native mover/particle routines. Individual exhaust particles are not networked.
+The client uses the game's weapon renderers; it does not simulate damage or
+projectile collisions.
 Explosions, impact particles, charging glows, shields, and other effects still
-need independent replication and visual verification. Scene delivery remains
-four updates per second, but unchanged ships now persist. Pose, health,
+need host-confirmed triggers, local presentation, and visual verification. Scene delivery remains
+targeted at four updates per second, but unchanged ships now persist. Pose, health,
 resources, energy, growth and timers update in place; changed structures and
-removed entities are replaced. Bounded linear/angular prediction and correction
-smoothing present motion between snapshots. The client is paced at 60 FPS;
+removed entities are replaced. A 100 ms source-time interpolation buffer presents
+motion between state frames, targeted at 20 Hz. Weapon, projectile and damage
+presentation select the same delayed frame; cosmetic mover values interpolate
+between accepted frames on that source timeline. Source velocity uses simulation
+seconds; presentation accounts for the measured simulation pace. This buffer adds
+visible control delay; immediate local input replay remains experimental and off.
+Input is
+sampled at 30 Hz, with additional native weapon press/release transitions.
+Large scene decoding and planning run in separate worker processes, so Lua parsing
+cannot stall motion delivery through Python's shared interpreter lock. Older
+geometry frames do not rewind roots already on the fast state stream. The stock
+camera receives the presented pose before following it. The client is paced at 60 FPS;
 visual smoothness still needs a two-computer playtest.
+Scene imports use a private native Console field. They keep the live campaign
+streamer visible to the independent renderer throughout ship additions. Native
+motion and geometry also use the same ownership definition: an owned command's
+serialized faction, or neutral zero for a commandless fragment. Temporary native
+faction caches do not grant network ownership.
+Regular native clients now commit scene changes between completed renders.
+Verified same-command replacements retain their motion history. Commandless
+roots can retain it only when their unique minimum persistent block identity
+and native ownership survive the replacement; actual removals still reset it.
+When prepared motion has waited at least 75 ms, the update thread can request
+a slot after the next completed render. An unclaimed slot has a 2 ms requested
+wait budget; a claimed scene transaction retains the normal commit safety
+rules. This prevents repeated missed idle windows from starving fresh motion.
+It does not remove the 100 ms presentation buffer or make native Lua imports
+free of occasional frame-time spikes.
 
 ## Start on this computer
 
@@ -44,7 +72,7 @@ in one window; it starts no HTTP server.
 
 On the other computer, run the same launcher, choose the server or enter the
 host address, enter its join token, and choose **Join game**. Both sides must
-update together: native protocol version 4 and presentation version 2
+update together: native protocol version 7 and presentation version 2
 reject older alpha clients. Keep **Native campaign controls and HUD** checked.
 Choose the initial **MOUSE_ROT**, **KEY_ROT**, or **CARDINAL** mode. The game
 handles bindings, mode changes, aiming and weapon groups; navigation and
@@ -98,7 +126,9 @@ Source launches use a new redirected profile under `.runtime`; the packaged
 launcher uses `%LOCALAPPDATA%/Repopulated`. Normal save
 slots, enabled local/Workshop mods, and any separately running game are left
 alone. **Save current galaxy** creates a separate checkpoint generation under
-`.runtime/native-checkpoints`. Stop hosting, select that galaxy in the Host
+`.runtime/native-checkpoints` for source launches or
+`%LOCALAPPDATA%/Repopulated/native-checkpoints` for the standalone package.
+Stop hosting, select that galaxy in the Host
 tab, and host it again to continue; joining players use the new join token.
 Saving flushes native loaded sectors, campaign metadata, and blueprints, copies
 them on the game thread, and publishes a generation with file hashes. Loading
@@ -141,29 +171,100 @@ Game files are not redistributed by this repository.
 
 ## Verification
 
+The latest October 4 checks used both neutral-root continuity and the bounded
+motion handoff. The two-minute moving-flight comparison matched camera/zoom and
+capped the host at 60 Hz. The client displayed 7,104 frames and applied 394
+geometry updates. Both sides had 17 ms intervals at the 95th percentile; the
+client maximum was 29 ms and the host maximum was 18 ms. Neither recorded an
+interval over 50 ms. All four requested handoffs were claimed, and the gate
+completed 4,088 transactions without a timeout. All 963 neutral replacements
+and four owned-command replacements retained their source motion history,
+with no rejected tickets or unannounced resets. All 283,395 local exhaust
+emissions had valid curves.
+Report: `.runtime/live-controls-result-1791113407392586100.json`.
+
+The subsequent three-minute combat regression passed movement, firing, beams,
+damage, respawn, both sides' Map/Binding overlays, control coalescing and vacant
+AI takeover. It applied 534 geometry updates and displayed 10,699 client frames
+(about 59.4 FPS including startup). Client intervals were 17 ms at the 95th
+percentile and 23 ms maximum, with none over 50 ms. The uncapped host's maximum
+was 20 ms; its frame rate is not a matched comparison. All 29,902 compared
+runtime pilot health values matched their selected authoritative frame. The
+gate completed 6,051 transactions without a timeout; its longest transaction
+was 16.011 ms and longest overlapping render wait was 14.561 ms. Four handoff
+requests were claimed across seven reservations; three unclaimed reservations
+expired safely. The longest actual reservation wait was 3.159 ms: the 2 ms
+requested timeout is subject to Windows scheduling. All 4,192 neutral and 20
+owned-command replacements retained their source curves without rejected
+tickets or unannounced resets. All 777,487 local exhaust emissions had valid
+curves, with no stale, missing, publication or invalid-root skips.
+Report: `.runtime/coop-check-1791113791155426300.json`.
+
+Sparse admission events retain every successful-acceptance gap of at least
+150 ms. In the final combat run, the three such gaps were 217 ms during the
+client Binding overlay, 367 ms across respawn, and 309 ms across a host menu
+transition. All other gaps were below 150 ms; the largest logged ordinary-play
+gap was 141 ms, with oldest prepared motion waiting 103.535 ms. The moving
+run's largest post-loading pending age was 93.974 ms. Lifetime pending maxima
+also include about 1.65-1.68 seconds while the first scene loaded. New reports
+retain that honest lifetime maximum and separately expose
+`bootstrapPendingAgeMs` and `longestActivePendingAgeMs`. These are delivery
+measurements, not end-to-end physical-input latency.
+
+An earlier combat regression had 15 intervals over 50 ms and a 98 ms maximum.
+Owned wire-buffer conversion, geometry preparation before the transaction,
+bounded native vector/block reads, and suppressing repeated diagnostic scene
+scans reduced those costs. A later audit found prepared motion waiting 405 ms
+for an idle scene slot; the bounded handoff addresses that scheduling gap.
+The latest combat capture starts 100 seconds after native readiness and records
+75 seconds, covering the late phase where earlier pauses occurred. These are
+repeat scenarios in nondeterministically evolving galaxies, not identical
+scene replays. Root continuity counters do not certify every attached child's
+independent motion. Native Lua loading and blueprint fields remain intact and
+can still cause brief import hitches. These short local results establish
+improvement, not complete cosmetic parity or performance on a second machine.
+
+The captures show both native game windows and are retained under
+`.runtime/smoothness-recordings`. The recorder keeps the latest test and the
+latest successful comparison, protecting unfinished captures. Video capture can
+drop frames: comparisons record approximately 40–42 FPS despite the native game's
+roughly 60 Hz cadence. Recordings cannot certify every rendered frame.
+
+Native health comparison covers stable pilot block IDs common to the selected
+damage frame and current geometry. Geometry membership is verified separately;
+the health comparison excludes blocks awaiting addition or removal. Exhaust
+origins now evaluate the source curve at each local native emission, and mover
+throttle interpolates between accepted visual frames. Exhaust appearance still
+differs during turns; native frame cadence alone does not prove cosmetic parity.
+
+Immediate local pilot movement is experimental and disabled in the regular
+launcher. It uses native thrusters and the native velocity integrator, then
+rebases unacknowledged movement against host state. A separate 45-second
+matching-input fixture ran 2,411 prediction steps and 744 reconciliations, with
+a maximum positional correction of 27.853 world units; frame intervals were
+17 ms at the 95th percentile and 22 ms maximum. This is not proof of physical
+control or collision parity. A bounded manual test is available using
+`tools/check_native_live_controls.py --exe <path> --seconds 180 --predict-local`.
+Its `--test-controls` option drives native navigation internally and must not
+be described as a physical keyboard test. Report:
+`.runtime/live-controls-result-1791084556910010000.json`.
+
 This check launches and stops two private native game processes and sends
 actual TCP drive/fire commands. It does not synthesize keyboard presses:
 
 ```powershell
-python tools/native_coop.py check --exe D:/SteamLibrary/steamapps/common/Reassembly/win64/ReassemblyRelease.exe --seconds 180 --check-respawn --check-backpressure --check-beams --check-health --check-map-menus --check-host-menus
+python tools/native_coop.py check --exe D:/SteamLibrary/steamapps/common/Reassembly/win64/ReassemblyRelease.exe --seconds 180 --check-respawn --check-backpressure --check-beams --check-health --check-map-menus --check-host-menus --record --record-seconds 75 --record-delay-seconds 100 --scene-idle-gate
 ```
 
-The latest separate-exploration 180-second native-client run applied 688 updates
-and observed 10,733 presented frames (about 59.6 FPS across the run). The 95th
-percentile frame interval was 17 ms, the largest was 22 ms, and no interval
-exceeded 50 ms. Runtime pilot health matched across 688 snapshots and 38,528
-block comparisons, with maximum error 0.000260. The test verified bounded input
-coalescing without dropped controls, native effects, and one test respawn.
-Native map/Binding open/close cycles passed on both sides: the client applied
-eight snapshots during each two-second overlay, while the host exported
-12 and 11 snapshots during its three-second overlays. The map readback matched
-100 cells, region records and the remote's discovered objective markers
-throughout the run. The server withheld undiscovered remote marker records.
-The test-only beam fixture substitutes a stock laser in the private ships;
-it never changes installed game content. It also verified movement, firing,
-respawn, bounded control coalescing during a deliberate pause, and AI takeover
-after disconnect. These short local results
-do not prove sustained 60 FPS or smooth motion on a second machine.
+The optimized combat run used independent exploration and verified native map
+readback for 100 cells, region records and the remote's discovered objective
+markers. The client applied six snapshots during its Map overlay and nine
+during Binding; the host exported 11 and 12 snapshots during its overlays.
+The test-only beam fixture substitutes a stock laser in the private ships and
+does not change installed content. The input test deliberately pauses native
+consumption for four seconds, then verifies bounded coalescing without dropped
+controls. One real respawn was verified; its new command identity resets motion
+history, while same-command structural replacements retain their source curve.
 
 Additional native checks:
 

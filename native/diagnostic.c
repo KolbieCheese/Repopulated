@@ -10,6 +10,18 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
+#include "monotonic_clock.h"
+#include "wire_hex.h"
+
+/* Callers pass only their own Frida-allocated wire buffers. These conversions
+ * can run on the message thread: they never inspect or mutate game objects. */
+__declspec(dllexport) int RepopulatedDecodeHex(const char *hex,int length,unsigned char *out,int capacity){
+    return replica_hex_decode(hex,length,out,capacity);
+}
+__declspec(dllexport) int RepopulatedEncodeHex(const unsigned char *bytes,int length,char *out,int capacity){
+    return replica_hex_encode(bytes,length,out,capacity);
+}
 
 static bool checked, compatible;
 static FILE *output;
@@ -53,6 +65,8 @@ __declspec(dllexport) bool CreateAiActions(void *ai) {
     initialize();
     return false; /* Leave vanilla AI behavior in place. */
 }
+
+#include "host_ai.c"
 
 static uintptr_t owned_cluster_command(void *cluster) {
     uintptr_t command,owner;uint64_t features;
@@ -341,18 +355,34 @@ __declspec(dllexport) int RepopulatedExportCluster(void *zone, int faction) {
 #include "campaign_fixture.c"
 #include "campaign_save.c"
 #include "persistent_replica.c"
+#include "replica_motion.c"
+#include "realtime_state.c"
+#include "pilot_prediction.c"
 #include "campaign_map.c"
 
 /* Replica simulation suppression stays in native code. A JavaScript callback
  * per block/AI update made large scenes needlessly expensive. */
 __declspec(dllexport) bool RepopulatedReplicaBlockUpdate(void *block,unsigned flags) {
-    (void)block;(void)flags;return false;
+    (void)flags;uintptr_t cluster=0;read_mem((char*)block+0xb8,&cluster,8);
+    realtime_mover_update(block,replica_prediction_active(cluster));return false;
 }
 __declspec(dllexport) void RepopulatedReplicaAIUpdate(void *ai,bool force) {
     (void)force;replica_player_update(ai);
 }
 __declspec(dllexport) void RepopulatedReplicaPhysicsStep(void *space,double delta) {
-    (void)space;(void)delta;
+    replica_predict_step(space,delta);
+}
+
+/* Session bootstrap needs the roster length, not diagnostic per-ship dumps.
+ * Keep the full sampler opt-in so retrying a gated import does not repeatedly
+ * scan the scene and flush a diagnostic file on the native update thread. */
+__declspec(dllexport) int RepopulatedCountNativeClusters(void *zone){
+    initialize();if(!compatible || !zone)return -1;
+    uintptr_t vector[3];
+    if(!read_mem((char*)zone+0x188,vector,sizeof(vector)))return -2;
+    if(vector[1]<vector[0] || vector[2]<vector[1] || (vector[1]-vector[0])%sizeof(void*) ||
+       vector[2]-vector[0]>1000000*sizeof(void*))return -3;
+    return (int)((vector[1]-vector[0])/sizeof(void*));
 }
 
 __declspec(dllexport) int RepopulatedSample(void *zone) {

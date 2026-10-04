@@ -69,6 +69,18 @@ const steam = Process.getModuleByName('steam_api64.dll');
 const noSteam = new NativeCallback(() => { send({type:'steam-disabled'}); return 0; }, 'int', []);
 Interceptor.replace(steam.getExportByName('SteamAPI_Init'), noSteam);
 const game = Process.getModuleByName('ReassemblyRelease.exe');
+if(cfg.testQuietWorld && cfg.campaignRemote){
+  // Isolate network motion in private recordings. These guards are never
+  // selected by the launcher and do not change the production simulation.
+  let blockedShots=0,blockedDamage=0;
+  Interceptor.replace(game.getExportByName('?fireWeapon@Block@@QEAA_NAEAUFiringData@@@Z'),new NativeCallback(()=>{
+    blockedShots++;return 0;
+  },'bool',['pointer','pointer']));
+  Interceptor.replace(game.getExportByName('?removeHealth@Block@@QEAAMMPEAU1@H@Z'),new NativeCallback(()=>{
+    blockedDamage++;return 0;
+  },'float',['pointer','float','pointer','int']));
+  setInterval(()=>send({type:'quiet-world-fixture',blockedShots,blockedDamage}),1000);
+}
 let sampler = null, loaded = false, lastSample = 0, callbacks = 0, sampled = 0;
 let mover = null, movesApplied = false;
 const pendingMoves = [];
@@ -83,19 +95,111 @@ const knownIdents = new Set();
 let initialBindingsApplied=false;
 let worldExporter=null, worldLoader=null, consoleContext=null, pendingWorld=null, worldSeq=-1;
 let worldLoadMessage=null;
-let replicaUpdater=null,replicaRemover=null,replicaStats=null;
+let replicaUpdater=null,replicaRemover=null,replicaReplacementRemover=null,replicaFragmentReplacementRemover=null,replicaBatchRemover=null,replicaBatchMessage=null,replicaStats=null,replicaRootCountReader=null;
+let replicaFieldStatsReader=null,ownershipStatsReader=null,ownershipStatsBuffer=null,lastOwnershipReport=0;
 let campaignMapExporter=null,campaignMapRemoteExporter=null,campaignMapApply=null,campaignMapExplore=null,campaignObjectivesApply=null,nativeMapRenders=0;
 let replicaInitialized=false;
 let campaignAuthorityZone=null,campaignAuthorityEnded=false,hostFlightState=null,hostMenuActive=false,hostMenuBusy=false,hostUpdateThread=null,hostMenuUpdates=0,hostMenuBrakes=0;
 const campaignConsole=cfg.nativeCampaignClient?Memory.alloc(0x300):null;
 let campaignReplicaZone=null;
 const nativeWeaponTargets=new Map();
+let nativeManualWeapons=[],nativeManualFeatures=[];
+let nativeManualMaskKey='';
+let motionRead=null,motionApply=null,motionBuffer=null,realtimeRead=null,realtimeBuffer=null,realtimeVisualApply=null,realtimeHealthApply=null,realtimeMoversApply=null,realtimeMoverWindowApply=null,localMoverCounter=null;
+let wireHexDecode=null,wireHexEncode=null;
+let predictionTick=null,predictionAck=null,predictionStats=null,realtimeHealthAudit=null,motionBegin=null,motionTimelineStats=null,motionApplyMessage=null,presentationRateReader=null,presentationGuardStats=null,framePaceStatsReader=null;
+let localExhaustStatsReader=null,localExhaustStatsBuffer=null;
+let replacementStatsReader=null,replacementStatsBuffer=null;
+const sceneIdleGateEnabled=sceneGateSettings(cfg);
+let sceneGateReady=false,sceneGateTryBegin=null,sceneGateEnd=null,sceneGateStatsReader=null,sceneGateStatsBuffer=null;
+let visualBegin=null,viewSourceTimeReader=null,interpolationStatsReader=null,presentationClockReader=null,lastPresentationClock={},lastVisualFrame=null,lastHealthFrame=null,lastMoverWindow=null,visualFrameApplications=0;
+const preparedVisualFrames=[];
+let visualHistoryEpoch=0,visualHistoryResets=0;
+const presentationDelayMs=cfg.presentationDelayMs===undefined?0:cfg.presentationDelayMs;
+if(!Number.isFinite(presentationDelayMs)||presentationDelayMs<0||presentationDelayMs>200)throw new Error('Invalid presentation delay');
+let predictionTestDriver=null,predictionTestAt=0;
+let smoothFlightStarted=0,smoothFlightPhase=null,smoothFlightCycle=-1;
+let lastMotionExport=0,motionSequence=0,pendingMotion=null,lastMotion=null,motionApplied=0,latestInputSequence=-1,latestInputTick=0;
+let pendingMotionSince=0,pendingMotionQueuedSince=0,lastAcceptedMotionAt=0,sceneHandoffRequested=false;
+let sceneHandoffBound=false,sceneHandoffRequest=null,sceneHandoffStatsReader=null,sceneHandoffStatsBuffer=null;
+const motionAdmissionStats={preparedFrames:0,acceptedFrames:0,supersededFrames:0,deferredAttempts:0,
+  longestPendingAgeMs:0,bootstrapPendingAgeMs:0,longestActivePendingAgeMs:0,longestAcceptanceGapMs:0,
+  lastPreparedSeq:0,lastAppliedSeq:0,lastPreparedAtMs:0,lastAppliedAtMs:0};
+let nativeZoneUpdates=0,nativeHeartbeatCalls=0;
+let nativeDrawThread=null,nativeSwapThread=null,nativeCameraThread=null;
+let motionTraceReader=null,motionTraceBuffer=null,lastMotionTrace=0;
+const thrustAuditIdent=thrustAuditSettings(cfg.testThrustAudit);
+let thrustAuditReader=null,thrustAuditBuffer=null,thrustAuditStatsBuffer=null,lastThrustAuditCenter=null,lastThrustAuditReport=0,thrustAuditBusySkips=0;
+let particleRenderAuditReader=null,particleRenderAuditBuffer=null,lastParticleRenderAuditCalls=0,particleRenderAuditBusySkips=0;
+let comparisonFocusReader=null,comparisonFocusBuffer=null;
+const comparisonViewConfig=comparisonViewSettings(cfg.testComparisonView);
+const comparisonFrameLimit=comparisonFrameLimitSettings(cfg.testComparisonFrameLimit,comparisonViewConfig);
+let comparisonFocus=null,lastComparisonView=null;
+const comparisonViewCounts={applied:0,held:0,busy:0,missing:0,focusReads:0,fallbacks:0};
+let presentationStageClock=null,lastCameraPresentationStage=null,lastDrawPresentationStage=null;
+function capturePresentationStage(kind){
+  if(!cfg.measureMotion)return null;
+  if(!presentationStageClock){
+    const dll=Process.findModuleByName('RepopulatedDiagnostic.dll');if(!dll)return null;
+    presentationStageClock=new NativeFunction(dll.getExportByName('RepopulatedMonotonicMillis'),'double',[]);
+  }
+  const stage={atMs:presentationStageClock(),frame:displayFrames,thread:Process.getCurrentThreadId()};
+  if(kind==='camera')lastCameraPresentationStage=stage;else lastDrawPresentationStage=stage;
+  return stage;
+}
+let hostAIStatsReader=null,hostAIStatsBuffer=null,hostAIStats=null,hostAIOwnedCallback=null,lastHostAIReport=0,hostAIOriginalCalls=0,vanillaEvidenceSent=false;
+function reportHostAIStats(){
+  if(!hostAIStatsReader || Date.now()-lastHostAIReport<500)return;
+  lastHostAIReport=Date.now();hostAIStatsReader(hostAIStatsBuffer);
+  const forwarded=hostAIStatsBuffer.add(8).readDouble();
+  hostAIStats={total:hostAIStatsBuffer.readDouble(),nativeForwarded:forwarded,
+               remoteDispatch:hostAIStatsBuffer.add(16).readDouble(),fallback:hostAIStatsBuffer.add(24).readDouble(),
+               originalCalls:forwarded+hostAIOriginalCalls};
+  send({type:'actor-control-ai-stats',...hostAIStats});
+  if(!vanillaEvidenceSent && hostAIStats.originalCalls>=300){vanillaEvidenceSent=true;send({type:'vanilla-ai-preserved',calls:hostAIStats.originalCalls,source:'native-prefilter'});}
+}
+function readOwnershipStats(){
+  if(!ownershipStatsReader)return {};
+  ownershipStatsReader(ownershipStatsBuffer);
+  const values=Array.from({length:4},(_,i)=>ownershipStatsBuffer.add(i*8).readDouble());
+  return {sourceCommandlessCachedNonneutral:values[0],replicaCommandlessCachedNonneutral:values[1],
+          sourceOwnedSerialCacheMismatch:values[2],replicaOwnedSerialCacheMismatch:values[3]};
+}
+function reportHostOwnershipStats(){
+  if(!cfg.measureMotion || !cfg.campaignRemote || !ownershipStatsReader || Date.now()-lastOwnershipReport<500)return;
+  lastOwnershipReport=Date.now();send({type:'ownership-audit',emittedAtMs:lastOwnershipReport,...readOwnershipStats()});
+}
+const nativeStageTimes=new Map(),nativeLastStages=new Map();
+function nativeStage(stage,seq=null){
+  if(!(cfg.traceNativeStages || cfg.measureMotion))return;
+  const now=Date.now(),thread=Process.getCurrentThreadId(),record={stage,seq,enteredAtMs:now,thread};nativeLastStages.set(thread,record);
+  if(!cfg.traceNativeStages && now-(nativeStageTimes.get(stage)||0)<200)return;
+  nativeStageTimes.set(stage,now);send({type:'native-stage',...record});
+}
+const streamStats={motion:0,world:0,input:0,maxPrepareMs:0,maxApplyMs:0,zoneSkips:0};
+const deliveryTimings={};
+let lastMotionPrepared=0,lastMotionApplied=0,lastMotionSampled=0;
+function timing(name,milliseconds){
+  milliseconds=Math.max(0,milliseconds);
+  let row=deliveryTimings[name];if(!row)row=deliveryTimings[name]={count:0,total:0,max:0,histogram:new Array(501).fill(0)};
+  row.count++;row.total+=milliseconds;row.max=Math.max(row.max,milliseconds);row.histogram[Math.min(500,Math.floor(milliseconds))]++;
+}
+function deliverySummary(){
+  const result={};for(const [name,row] of Object.entries(deliveryTimings)){
+    let sum=0,p95=0;for(let i=0;i<row.histogram.length;i++){sum+=row.histogram[i];if(sum>=Math.ceil(row.count*0.95)){p95=i;break;}}
+    result[name]={samples:row.count,meanMs:row.total/row.count,p95Ms:p95,maxMs:row.max};
+  }return result;
+}
+let clientViewRadius=cfg.interestRadius || 5000,clientViewChangedAt=0;
 let nativeFocused=true,nativeFlightActive=true,lastNativeIntent=null;
 let testNativeMenuStage=0,testNativeMenuAt=0,testNativeModal=null;
 let nativeFlightState=null,nativeUIHeartbeat=null,applyingFromMenu=false,menuSnapshotApplies=0,heartbeatBusy=false,nativeUpdateThread=null;
 function sendNativeIntent(record) {
+  record={...record,streamStats:{...streamStats,preparedMotion:motionSequence,appliedMotion:lastMotion?lastMotion.seq:0,pendingMotion:pendingMotion?pendingMotion.seq:0,
+    oldestPendingAgeMs:pendingMotionSince?Math.max(0,Date.now()-pendingMotionSince):0}};
+  if(cfg.measureMotion)record={...record,emittedAtMs:Date.now(),thread:Process.getCurrentThreadId()};
   lastNativeIntent=record;
-  if(!nativeFocused || !nativeFlightActive || openEditors.size)record={...record,dimensions:0x10a,destination:[0,0,0,0,0,0],
+  if((!nativeFocused && !cfg.testSmoothFlight) || !nativeFlightActive || openEditors.size)record={...record,dimensions:0x10a,destination:[0,0,0,0,0,0],
     weapons:record.weapons.map(row=>[row[0],0,...row.slice(2)]),inputBlocked:!nativeFocused?'focus':'menu'};
   send(record);
 }
@@ -107,22 +211,544 @@ if(cfg.nativeCampaignClient)Interceptor.attach(game.getExportByName('?fireWeapon
     nativeWeaponTargets.set(block.add(0x30).readU32(),[data.add(8).readFloat()-position[0],data.add(12).readFloat()-position[1],data.add(24).readFloat(),data.add(28).readFloat(),data.add(52).readFloat()]);
   }
 });
+if(cfg.nativeCampaignClient){
+  const target=game.base.add(0x1d09c0),prefix=[0x48,0x8b,0xc4,0x48,0x89,0x50,0x10,0x55,0x53,0x56];
+  const actual=new Uint8Array(target.readByteArray(prefix.length));
+  if(prefix.some((b,i)=>actual[i]!==b))throw new Error('Native manual weapon targeting signature differs');
+  Interceptor.attach(target,{onEnter(args){this.player=args[0];},onLeave(){
+    if(!clusterIdent)return;
+    const command=this.player.add(0xa8).readPointer();if(command.isNull())return;
+    const cluster=command.add(0xb8).readPointer();if(cluster.isNull() || clusterIdent(cluster)!==cfg.followPilot)return;
+    const zone=this.player.add(0xf8).readPointer(),position=[cluster.add(0x30).readDouble(),cluster.add(0x38).readDouble()];
+    const cursor=[zone.add(0x4c).readFloat()-position[0],zone.add(0x50).readFloat()-position[1],0,0,0];
+    const begin=cluster.add(0xf0).readPointer(),count=cluster.add(0xf8).readPointer().sub(begin).toInt32()/8;
+    if(count<0 || count>4096)throw new Error('Native manual weapon block limit');
+    const weapons=[],features=[];
+    for(let i=0;i<count;i++){
+      const block=begin.add(i*8).readPointer(),f=block.add(0x40).readU64().and(uint64('0x800008e0')).toNumber();
+      if(!(f&0x8e0))continue;
+      const id=block.add(0x30).readU32(),enabled=block.add(0x100).readU64().and(uint64('0x800008e0')).toNumber();
+      const turret=block.add(0x40).readU64().and(uint64(0x10)).toNumber()?block.add(0x158).readPointer():ptr(0);
+      const aim=turret.isNull()?Math.atan2(cursor[1],cursor[0]):turret.add(0x10).readFloat();
+      const values=nativeWeaponTargets.get(id) || cursor;
+      weapons.push([id,enabled,...values.slice(0,4),turret.isNull()?values[4]:turret.add(0x14).readFloat(),aim]);features.push(f);
+    }
+    if(weapons.length>256)throw new Error('Native manual weapon limit');
+    nativeManualWeapons=weapons;nativeManualFeatures=features;
+    const key=weapons.map(row=>row[0]+':'+row[1]).join(',');
+    if(key!==nativeManualMaskKey){
+      nativeManualMaskKey=key;
+      // A short native press can fit between regular 30 Hz flight samples.
+      // Emit transitions at this verified native decision point as well.
+      if(lastNativeIntent)sendNativeIntent({...lastNativeIntent,weapons,weaponFeatures:features});
+    }
+  }});
+}
+function installWireHex(dll){
+  if(wireHexDecode && wireHexEncode)return;
+  wireHexDecode=new NativeFunction(dll.getExportByName('RepopulatedDecodeHex'),'int',['pointer','int','pointer','int']);
+  wireHexEncode=new NativeFunction(dll.getExportByName('RepopulatedEncodeHex'),'int',['pointer','int','pointer','int']);
+}
+function wireHexReady(){
+  if(wireHexDecode && wireHexEncode)return true;
+  const dll=Process.findModuleByName('RepopulatedDiagnostic.dll');
+  if(!dll)return false;
+  installWireHex(dll);return true;
+}
 function packedBuffer(hex){
+  if(typeof hex!=='string' || hex.length%2 || hex.length>2*1048576)throw new Error('Invalid packed hex bounds');
+  if(wireHexReady()){
+    const size=hex.length/2,buffer=Memory.alloc(Math.max(1,size));
+    const decoded=wireHexDecode(Memory.allocUtf8String(hex),hex.length,buffer,size);
+    if(decoded!==size)throw new Error('Native packed hex decode failed: '+decoded);
+    return buffer;
+  }
+  if(!/^[a-f0-9]*$/.test(hex))throw new Error('Invalid packed hex data');
   const data=[];for(let i=0;i<hex.length;i+=2)data.push(parseInt(hex.slice(i,i+2),16));
   const buffer=Memory.alloc(Math.max(1,data.length));if(data.length)buffer.writeByteArray(data);return buffer;
 }
+function hexBuffer(buffer,length){
+  if(!Number.isInteger(length) || length<0 || length>1048576)throw new Error('Invalid native hex source bounds');
+  if(wireHexReady()){
+    const size=length*2,output=Memory.alloc(size+1);
+    const encoded=wireHexEncode(buffer,length,output,size+1);
+    if(encoded!==size)throw new Error('Native packed hex encode failed: '+encoded);
+    return size?output.readUtf8String(size):'';
+  }
+  return Array.from(new Uint8Array(buffer.readByteArray(length)),b=>b.toString(16).padStart(2,'0')).join('');
+}
+function retainVisualFrame(frames,frame){
+  const previous=frames[frames.length-1];
+  if(previous && frame.sourceTimeMs-previous.sourceTimeMs>500){frames.length=0;visualHistoryEpoch++;visualHistoryResets++;}
+  frame.visualEpoch=visualHistoryEpoch;frames.push(frame);
+  if(frames.length>12)frames.shift();
+}
+function selectVisualFrame(frames,sourceViewTime){
+  if(!frames.length)return null;
+  let chosen=frames[0];
+  for(const frame of frames){if(frame.sourceTimeMs>sourceViewTime)break;chosen=frame;}
+  return chosen;
+}
+function currentVisualFrame(){
+  if(!lastMotion || !realtimeHealthApply)return null;
+  const eligible=preparedVisualFrames.filter(frame=>frame.seq<=lastMotion.seq && frame.visualEpoch===lastMotion.visualEpoch);
+  const viewTime=presentationDelayMs>0?viewSourceTimeReader():0;
+  const previous=lastVisualFrame && lastVisualFrame.visualEpoch===lastMotion.visualEpoch?lastVisualFrame:null;
+  return presentationDelayMs>0?(viewTime<0&&previous?previous:selectVisualFrame(eligible,viewTime)):lastMotion;
+}
+function nextMoverFrame(frame){
+  if(!frame || !lastMotion || frame.visualEpoch!==lastMotion.visualEpoch)return null;
+  const next=preparedVisualFrames.find(candidate=>candidate.visualEpoch===frame.visualEpoch &&
+    candidate.seq>frame.seq && candidate.seq<=lastMotion.seq);
+  if(next && (!Number.isFinite(next.sourceTimeMs) || next.sourceTimeMs<frame.sourceTimeMs || next.sourceTimeMs-frame.sourceTimeMs>500))
+    throw new Error('Invalid realtime mover window source time');
+  return next || null;
+}
+function consumeVisualFrame(zone,restoreHealth=false){
+  const frame=currentVisualFrame();
+  if(!frame)return;
+  const changed=!lastVisualFrame || frame.seq!==lastVisualFrame.seq;
+  const useMoverWindow=cfg.nativeCampaignClient && cfg.fastMotion && realtimeMoverWindowApply!==null;
+  const next=useMoverWindow?nextMoverFrame(frame):null;
+  const windowChanged=useMoverWindow && (!lastMoverWindow || lastMoverWindow.epoch!==frame.visualEpoch ||
+    lastMoverWindow.a!==frame.seq || lastMoverWindow.b!==(next?next.seq:0));
+  if(!changed && !restoreHealth && !windowChanged)return;
+  const started=Date.now();let stage=started;
+  if(changed || restoreHealth){
+    if(visualBegin)visualBegin(frame.sourceTimeMs);
+    nativeStage('motion-health',frame.seq);
+    if(realtimeHealthApply(zone,frame.health.buffer,frame.health.count)<0)throw new Error('Native realtime health apply failed');
+    lastHealthFrame=frame;timing('healthApply',Date.now()-stage);stage=Date.now();
+  }
+  if(changed){
+    nativeStage('motion-visuals',frame.seq);
+    const applied=realtimeVisualApply(zone,frame.blocks.buffer,frame.blocks.count,frame.projectiles.buffer,frame.projectiles.count,ptr(0),0);
+    if(applied<0)throw new Error('Native realtime visual apply failed: '+applied);
+    timing('visualApply',Date.now()-stage);stage=Date.now();
+  }
+  if(useMoverWindow){
+    const count=realtimeMoverWindowApply(frame.movers.buffer,frame.movers.count,frame.sourceTimeMs,
+      next?next.movers.buffer:ptr(0),next?next.movers.count:0,next?next.sourceTimeMs:frame.sourceTimeMs);
+    if(count!==frame.movers.count)throw new Error('Native realtime mover window apply failed: '+count);
+    lastMoverWindow={a:frame.seq,b:next?next.seq:0,epoch:frame.visualEpoch};timing('moversApply',Date.now()-stage);
+  }else if(changed){
+    if(realtimeMoversApply(frame.movers.buffer,frame.movers.count)<0)throw new Error('Native realtime mover apply failed');
+    lastMoverWindow=null;timing('moversApply',Date.now()-stage);
+  }
+  if(changed){lastVisualFrame=frame;visualFrameApplications++;}
+  timing(restoreHealth?'visualFrameRestore':'visualFrameApply',Date.now()-started);
+}
+function applyMotionFrame(zone,frame,replay=true){
+  const started=Date.now();
+  if(replay){
+    if(lastMotionApplied)timing('applyInterval',started-lastMotionApplied);lastMotionApplied=started;
+    timing('receiveToApply',started-frame.received);
+  }
+  if(replay){
+    nativeStage('motion-begin',frame.seq);
+    if(motionBegin)motionBegin(frame.seq,Math.max(0,(started-frame.received)/1000),frame.sourceTimeMs,frame.simTimeMs);
+  }
+  if(predictionAck && replay)predictionAck(frame.inputTick,frame.seq);
+  nativeStage('motion-poses',frame.seq);
+  const count=motionApply(zone,frame.buffer,frame.count);
+  if(count<0){
+    const detail=motionApplyMessage?motionApplyMessage().readUtf8String():'native diagnostic unavailable';
+    send({type:'motion-apply-failed',result:count,seq:frame.seq,replay,sourceTimeMs:frame.sourceTimeMs,simTimeMs:frame.simTimeMs,
+          poseCount:frame.count,poses:hexBuffer(frame.buffer,frame.count*44),worldSeq,
+          visualFrameSeq:lastVisualFrame?lastVisualFrame.seq:0,detail});
+    throw new Error('Native motion apply failed: '+count+'; seq='+frame.seq+' replay='+replay+'; '+detail);
+  }
+  timing(replay?'posesApply':'posesRestore',Date.now()-started);
+  if(count){if(replay)motionApplied++;replicaPresentedAt=frame.received;}
+  streamStats.maxApplyMs=Math.max(streamStats.maxApplyMs,Date.now()-started);
+  timing(replay?'motionPoseAccept':'motionRestore',Date.now()-started);
+  if(replay)noteMotionAcceptance(zone,frame);
+}
 let interestExporter=null,displayFrames=0,lastPilotInput=0,drawCalls=0,pollCalls=0,lastView=null,replicaPilot=null,pilotRenderCalls=0;
 let lastPresentation=0,longFrames=0,maxFrameMs=0;
-let replicaPresenter=null,replicaPresentedAt=0,predictedFrames=0;
+let replicaPresenter=null,replicaPresentedAt=0,predictedFrames=0,presenterBusySkips=0,traceBusySkips=0;
+let blockRenderCounter=null;
 let visualExporter=null,visualApply=null,visualTick=null,visualProjectiles=null,visualStats=null,visualIdentities=null;
 let projectilePass1Calls=0;
 const presentedPilot=Memory.alloc(8);
 const frameHistogram=new Array(251).fill(0);
+function presentReplica(zone,stageName){
+  const stage=capturePresentationStage(stageName);
+  if(!replicaPresenter || !replicaPresentedAt)return;
+  nativeStage('presenter');
+  const predicted=replicaPresenter(zone,Math.min(0.25,Math.max(0,(Date.now()-replicaPresentedAt)/1000)),cfg.followPilot,presentedPilot);
+  if(stage){stage.finishedAtMs=presentationStageClock();stage.result=predicted;}
+  if(predicted===-7){presenterBusySkips++;return;} // Presentation skips a busy metadata writer.
+  if(predicted<0)throw new Error('Replica presentation failed: '+predicted);
+  if(predicted>0){replicaPilot=[presentedPilot.readFloat(),presentedPilot.add(4).readFloat()];predictedFrames++;}
+}
+function thrustAuditSettings(value){
+  if(value===undefined || value===null)return 0;
+  if(value!==0x70000002)throw new Error('Invalid native thrust audit fixture');
+  return value;
+}
+function configureThrustAudit(dll){
+  if(!thrustAuditIdent || thrustAuditReader)return;
+  const configure=new NativeFunction(dll.getExportByName('RepopulatedConfigureThrustAudit'),'int',['uint','bool']);
+  const configured=configure(thrustAuditIdent,Number(!cfg.renderOnly));
+  if(configured<0)throw new Error('Native thrust audit configuration failed: '+configured);
+  thrustAuditReader=new NativeFunction(dll.getExportByName('RepopulatedReadThrustAudit'),'int',['pointer','int','pointer']);
+  thrustAuditBuffer=Memory.alloc(128*28*8);thrustAuditStatsBuffer=Memory.alloc(4*8);
+  const particleRender=game.base.add(0x458c0),prefix=[0x48,0x89,0x5c,0x24,0x20,0x4c,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10];
+  const actual=new Uint8Array(particleRender.readByteArray(prefix.length));
+  if(prefix.some((byte,i)=>actual[i]!==byte))throw new Error('Native particle render audit signature differs');
+  const original=Interceptor.replaceFast(particleRender,dll.getExportByName('RepopulatedAuditParticleRender'));
+  try{new NativeFunction(dll.getExportByName('RepopulatedSetParticleRenderAuditOriginal'),'void',['pointer'])(original);}
+  catch(error){Interceptor.revert(particleRender);throw error;}
+  particleRenderAuditReader=new NativeFunction(dll.getExportByName('RepopulatedReadParticleRenderAudit'),'int',['pointer']);
+  particleRenderAuditBuffer=Memory.alloc(18*8);
+}
+function installHostThrustAudit(dll){
+  if(!thrustAuditIdent || cfg.renderOnly)return;
+  configureThrustAudit(dll);
+  const mover=game.base.add(0xf09e0),prefix=[0x48,0x8b,0xc4,0x53,0x57,0x48,0x81,0xec,0x08,0x01,0x00,0x00];
+  const actual=new Uint8Array(mover.readByteArray(prefix.length));
+  if(prefix.some((byte,i)=>actual[i]!==byte))throw new Error('Native audit mover signature differs');
+  const original=Interceptor.replaceFast(mover,dll.getExportByName('RepopulatedAuditMoverUpdate'));
+  try{new NativeFunction(dll.getExportByName('RepopulatedSetAuditMoverOriginal'),'void',['pointer'])(original);}
+  catch(error){Interceptor.revert(mover);throw error;}
+}
+function reportThrustAudit(center=null){
+  if(!thrustAuditReader)return;
+  reportParticleRenderAudit();
+  if(center)lastThrustAuditCenter=center;
+  const count=thrustAuditReader(thrustAuditBuffer,128,thrustAuditStatsBuffer);
+  if(count===-7){thrustAuditBusySkips++;return;}
+  if(count<0 || count>128)throw new Error('Native thrust audit read failed: '+count);
+  const values=Array.from({length:4},(_,i)=>thrustAuditStatsBuffer.add(i*8).readDouble());
+  if(values.some(value=>!Number.isFinite(value)||value<0) || values[3]!==28)throw new Error('Invalid native thrust audit stats');
+  if(!count && Date.now()-lastThrustAuditReport<500)return;
+  const rows=Array.from({length:count},(_,row)=>Array.from({length:28},(_,column)=>thrustAuditBuffer.add((row*28+column)*8).readDouble()));
+  if(rows.some(row=>row.some(value=>!Number.isFinite(value)) || row[1]!==thrustAuditIdent || !Number.isInteger(row[2]) || row[2]<=0 || row[2]>0xffffffff))
+    throw new Error('Invalid native thrust audit row');
+  lastThrustAuditReport=Date.now();
+  send({type:'thrust-audit',emittedAtMs:lastThrustAuditReport,frame:displayFrames,thread:Process.getCurrentThreadId(),
+        center:lastThrustAuditCenter,rows,presentationDelayMs,
+        stats:{total:values[0],dropped:values[1],pending:values[2],stride:values[3],busySkips:thrustAuditBusySkips}});
+}
+function reportParticleRenderAudit(){
+  if(!particleRenderAuditReader)return;
+  const ready=particleRenderAuditReader(particleRenderAuditBuffer);
+  if(ready===-7){particleRenderAuditBusySkips++;return;}
+  if(ready===0)return;
+  if(ready!==1)throw new Error('Native particle render audit read failed: '+ready);
+  const row=Array.from({length:18},(_,column)=>particleRenderAuditBuffer.add(column*8).readDouble());
+  if(row.some(value=>!Number.isFinite(value)))throw new Error('Invalid native particle render audit row');
+  if(row[15]===lastParticleRenderAuditCalls)return;
+  lastParticleRenderAuditCalls=row[15];
+  send({type:'particle-render-audit',emittedAtMs:Date.now(),frame:displayFrames,thread:Process.getCurrentThreadId(),
+        row,busySkips:particleRenderAuditBusySkips});
+}
+function readLocalExhaustStats(){
+  if(!localExhaustStatsReader)return {};
+  localExhaustStatsReader(localExhaustStatsBuffer);
+  const labels=['transformed','snapshotUnavailable','staleCurveSkipped','publicationMisses','invalidRootSkipped'];
+  const values=labels.map((label,i)=>localExhaustStatsBuffer.add(i*8).readDouble());
+  if(values.some(value=>!Number.isFinite(value)||value<0))throw new Error('Invalid native local exhaust stats');
+  return Object.fromEntries(labels.map((label,i)=>[label,values[i]]));
+}
+function sceneGateSettings(config){
+  for(const key of ['sceneIdleGate','testSceneIdleGate'])
+    if(config[key]!==undefined && typeof config[key]!=='boolean')throw new Error('Scene idle gate settings must be boolean');
+  if(config.sceneIdleGate!==true && config.testSceneIdleGate!==true)return false;
+  if(!config.nativeCampaignClient || !config.persistentReplica || !config.fastMotion || config.frameLimit!==60)
+    throw new Error('Scene idle gate requires the native campaign client');
+  return true;
+}
+function readReplacementStats(){
+  if(!replacementStatsReader)return {};
+  replacementStatsReader(replacementStatsBuffer);
+  const labels=['ownedDetached','neutralDetached','ownedBound','neutralBound','ownedRejected','neutralRejected','unannouncedResets','ordinaryResets'];
+  const values=labels.map((label,i)=>replacementStatsBuffer.add(i*8).readDouble());
+  if(values.some(value=>!Number.isFinite(value)||value<0))throw new Error('Invalid native replacement stats');
+  return Object.fromEntries(labels.map((label,i)=>[label,values[i]]));
+}
+function configureSceneGate(zone){
+  if(!sceneIdleGateEnabled || sceneGateReady)return;
+  if(!replicaInitialized || !campaignReplicaZone || !zone.equals(campaignReplicaZone) || nativeUpdateThread!==Process.getCurrentThreadId())
+    throw new Error('Native scene gate configuration requires the verified replica update thread');
+  if(nativeDrawThread===null)return; // Wait for a real native draw before identifying its execution model.
+  if(nativeDrawThread===nativeUpdateThread)throw new Error('Native scene idle gate requires distinct draw and update threads');
+  const dll=Process.getModuleByName('RepopulatedDiagnostic.dll');
+  const configure=new NativeFunction(dll.getExportByName('RepopulatedConfigureSceneGate'),'int',['pointer']);
+  sceneGateTryBegin=new NativeFunction(dll.getExportByName('RepopulatedTryBeginSceneUpdate'),'int',['pointer']);
+  sceneGateEnd=new NativeFunction(dll.getExportByName('RepopulatedEndSceneUpdate'),'int',['pointer','int']);
+  sceneGateStatsReader=new NativeFunction(dll.getExportByName('RepopulatedSceneGateStats'),'void',['pointer']);
+  sceneGateStatsBuffer=Memory.alloc(8*8);
+  // The next Render must close the idle window before it acquires engine
+  // state locks. Keeping the window through swap permits post-swap update
+  // callbacks to accept motion without waiting for accidental phase drift.
+  const boundary=game.base.add(0x118730),prefix=[0x48,0x8b,0xc4,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57];
+  const actual=new Uint8Array(boundary.readByteArray(prefix.length));
+  if(prefix.some((byte,i)=>actual[i]!==byte))throw new Error('Native scene render boundary signature differs');
+  const replacement=dll.getExportByName('RepopulatedRenderBoundary');
+  const setOriginal=new NativeFunction(dll.getExportByName('RepopulatedSetRenderBoundaryOriginal'),'void',['pointer']);
+  const original=Interceptor.replaceFast(boundary,replacement);
+  try{
+    setOriginal(original);
+    const configured=configure(zone);if(configured!==1)throw new Error('Native scene gate configuration failed: '+configured);
+  }catch(error){Interceptor.revert(boundary);throw error;}
+  sceneGateReady=true;send({type:'native-scene-gate',action:'configured',thread:Process.getCurrentThreadId()});
+}
+function trySceneUpdate(zone){
+  if(!sceneGateReady)return 2; // Initial import and legacy sessions use the existing path.
+  if(!zone.equals(campaignReplicaZone) || nativeUpdateThread!==Process.getCurrentThreadId())
+    throw new Error('Native scene update requires the verified replica update thread');
+  const acquired=sceneGateTryBegin(zone);
+  if(acquired!==0 && acquired!==1)throw new Error('Native scene gate acquisition failed: '+acquired);
+  return acquired;
+}
+function endSceneUpdate(zone,token,committed){
+  if(token!==1)return;
+  const ended=sceneGateEnd(zone,Number(committed));
+  if(ended!==1)throw new Error('Native scene gate release failed: '+ended);
+}
+function readSceneGateStats(){
+  if(!sceneGateStatsReader)return {};
+  sceneGateStatsReader(sceneGateStatsBuffer);
+  const labels=['acquired','deferred','transactions','maximumTransactionMs','renderWaits','maximumRenderWaitMs','timeouts','state'];
+  const values=labels.map((label,i)=>sceneGateStatsBuffer.add(i*8).readDouble());
+  if(values.some(value=>!Number.isFinite(value)||value<0))throw new Error('Invalid native scene gate stats');
+  return Object.fromEntries(labels.map((label,i)=>[label,values[i]]));
+}
+function bindSceneHandoff(){
+  if(sceneHandoffBound || !sceneGateReady)return;
+  sceneHandoffBound=true;
+  const dll=Process.getModuleByName('RepopulatedDiagnostic.dll');
+  const request=dll.findExportByName('RepopulatedRequestSceneHandoff');
+  const stats=dll.findExportByName('RepopulatedSceneHandoffStats');
+  // Older helpers retain the existing nonblocking gate without a reservation.
+  if(!request)return;
+  sceneHandoffRequest=new NativeFunction(request,'int',['pointer','int']);
+  if(stats){sceneHandoffStatsReader=new NativeFunction(stats,'void',['pointer']);sceneHandoffStatsBuffer=Memory.alloc(48);}
+}
+function queueMotionFrame(frame){
+  const now=Date.now();frame.preparedAtMs=now;
+  if(pendingMotion)motionAdmissionStats.supersededFrames++;
+  else pendingMotionQueuedSince=frame.received;
+  if(!pendingMotionSince)pendingMotionSince=pendingMotionQueuedSince;
+  pendingMotion=frame;
+  motionAdmissionStats.preparedFrames++;motionAdmissionStats.lastPreparedSeq=frame.seq;motionAdmissionStats.lastPreparedAtMs=now;
+}
+function motionAdmission(){
+  const age=pendingMotionSince?Math.max(0,Date.now()-pendingMotionSince):0;
+  motionAdmissionStats.longestPendingAgeMs=Math.max(motionAdmissionStats.longestPendingAgeMs,age);
+  const label=motionAdmissionStats.acceptedFrames?'longestActivePendingAgeMs':'bootstrapPendingAgeMs';
+  motionAdmissionStats[label]=Math.max(motionAdmissionStats[label],age);
+  return {...motionAdmissionStats,pendingSinceMs:pendingMotionSince,pendingAgeMs:age,pendingSeq:pendingMotion?pendingMotion.seq:0};
+}
+function reportMotionAdmission(action,zone,frame,age,gap=0,opportunity=null,bootstrap=motionAdmissionStats.acceptedFrames===0){
+  if(!cfg.measureMotion)return;
+  send({type:'native-motion-admission',action,emittedAtMs:Date.now(),thread:Process.getCurrentThreadId(),
+    phase:bootstrap?'bootstrap':'active',
+    opportunity,seq:frame.seq,receivedAtMs:frame.received,preparedAtMs:frame.preparedAtMs,
+    sourceTimeMs:frame.sourceTimeMs,oldestPendingAgeMs:age,acceptanceGapMs:gap,
+    appliedSeq:motionAdmissionStats.lastAppliedSeq,preparedSeq:motionAdmissionStats.lastPreparedSeq,sceneGate:readSceneGateStats()});
+}
+function noteMotionDeferred(zone,opportunity){
+  if(!pendingMotion || !sceneGateReady)return;
+  const age=motionAdmission().pendingAgeMs;motionAdmissionStats.deferredAttempts++;
+  if(age<75 || sceneHandoffRequested)return;
+  if(!zone.equals(campaignReplicaZone) || Process.getCurrentThreadId()!==nativeUpdateThread)
+    throw new Error('Native scene handoff requires the verified replica update thread');
+  bindSceneHandoff();
+  if(!sceneHandoffRequest)return;
+  const requested=sceneHandoffRequest(zone,1);
+  if(requested!==1)throw new Error('Native scene handoff request failed: '+requested);
+  sceneHandoffRequested=true;reportMotionAdmission('requested',zone,pendingMotion,age,0,opportunity);
+}
+function noteMotionAcceptance(zone,frame){
+  const now=Date.now(),age=pendingMotionSince?Math.max(0,now-pendingMotionSince):0;
+  const gap=lastAcceptedMotionAt?Math.max(0,now-lastAcceptedMotionAt):0;
+  const bootstrap=motionAdmissionStats.acceptedFrames===0;
+  motionAdmissionStats.longestPendingAgeMs=Math.max(motionAdmissionStats.longestPendingAgeMs,age);
+  const label=bootstrap?'bootstrapPendingAgeMs':'longestActivePendingAgeMs';
+  motionAdmissionStats[label]=Math.max(motionAdmissionStats[label],age);
+  motionAdmissionStats.longestAcceptanceGapMs=Math.max(motionAdmissionStats.longestAcceptanceGapMs,gap);
+  motionAdmissionStats.acceptedFrames++;motionAdmissionStats.lastAppliedSeq=frame.seq;motionAdmissionStats.lastAppliedAtMs=now;lastAcceptedMotionAt=now;
+  // An RPC can prepare another frame while a cooperative native call applies
+  // this one. Its first queued arrival becomes the new oldest unserved age.
+  pendingMotionSince=pendingMotion?pendingMotionQueuedSince:0;
+  if(!pendingMotion)pendingMotionQueuedSince=0;
+  if(sceneHandoffRequested){
+    const cleared=sceneHandoffRequest(zone,0);
+    if(cleared!==1)throw new Error('Native scene handoff reset failed: '+cleared);
+    sceneHandoffRequested=false;
+  }
+  if(age>=75 || gap>=150)reportMotionAdmission('accepted',zone,frame,age,gap,null,bootstrap);
+}
+function readSceneHandoffStats(){
+  bindSceneHandoff();
+  if(!sceneHandoffStatsReader)return {};
+  sceneHandoffStatsReader(sceneHandoffStatsBuffer);
+  const labels=['requests','reservations','claims','abandoned','maximumReservationWaitMs','requestPending'];
+  const values=labels.map((label,i)=>sceneHandoffStatsBuffer.add(i*8).readDouble());
+  if(values.some(value=>!Number.isFinite(value)||value<0))throw new Error('Invalid native scene handoff stats');
+  return Object.fromEntries(labels.map((label,i)=>[label,values[i]]));
+}
+function installReplicaField(dll,zone){
+  if(!cfg.nativeCampaignClient)return;
+  const getter=game.base.add(0xcab60),prefix=[0x40,0x53,0x56,0x57,0x48,0x83,0xec,0x30,0xc5,0xf8,0x29,0x74,0x24,0x20];
+  const actual=new Uint8Array(getter.readByteArray(prefix.length));
+  if(prefix.some((byte,i)=>actual[i]!==byte))throw new Error('Native replica field signature differs');
+  const original=Interceptor.replaceFast(getter,dll.getExportByName('RepopulatedReplicaField'));
+  try{
+    new NativeFunction(dll.getExportByName('RepopulatedSetFieldOriginal'),'void',['pointer'])(original);
+    const configured=new NativeFunction(dll.getExportByName('RepopulatedConfigureReplicaField'),'int',['pointer','pointer'])(campaignConsole,zone);
+    if(configured<0)throw new Error('Native replica field configuration failed: '+configured);
+    replicaFieldStatsReader=new NativeFunction(dll.getExportByName('RepopulatedReplicaFieldStats'),'void',['pointer']);
+  }catch(error){Interceptor.revert(getter);throw error;}
+}
+function replicaContinuity(plan){
+  if(!plan || !Array.isArray(plan.remove) || plan.remove.length>4096 || new Set(plan.remove).size!==plan.remove.length ||
+     plan.remove.some(ident=>!Number.isInteger(ident) || ident<=0 || ident>0xffffffff))
+    throw new Error('Invalid incremental removals');
+  const rows=plan.continuity===undefined?[]:plan.continuity;
+  if(!Array.isArray(rows)||rows.length>plan.remove.length||
+     new Set(rows.map(row=>Array.isArray(row)?row[0]:null)).size!==rows.length||
+     rows.some(row=>!Array.isArray(row)||![3,4].includes(row.length)||row.some(value=>!Number.isInteger(value))||
+       row[0]<=0||row[0]>0xffffffff||!plan.remove.includes(row[0])||row[1]<=0||row[1]>0xffffffff||row[2]<0||row[2]>0x7fffffff||
+       row.length===4 && (row[3]!==2 || row[1]!==row[0] || row[2]!==0)))
+    throw new Error('Invalid incremental continuity');
+  return new Map(rows.map(row=>[row[0],row]));
+}
+function applyReplicaRemovals(zone,plan,seq=null){
+  const continuity=replicaContinuity(plan);
+  if(!plan.remove.length)return 0;
+  if(cfg.nativeCampaignClient && sceneGateReady && replicaBatchRemover){
+    const identities=[...plan.remove].sort((a,b)=>a-b),rows=Memory.alloc(identities.length*16);
+    identities.forEach((ident,index)=>{
+      const requested=continuity.get(ident),generation=requested && (requested.length===3 || replicaFragmentReplacementRemover)?requested:null,row=rows.add(index*16);
+      row.writeU32(ident);row.add(4).writeU32(generation?generation[1]:0);
+      row.add(8).writeS32(generation?generation[2]:0);row.add(12).writeU32(generation?(generation.length===4?2:1):0);
+    });
+    const removed=replicaBatchRemover(zone,rows,identities.length);
+    if(!Number.isInteger(removed) || removed<0 || removed>identities.length){
+      const detail=replicaBatchMessage?replicaBatchMessage().readUtf8String():'native diagnostic unavailable';
+      send({type:'replica-removal-failed',seq,result:removed,remove:identities,continuity:[...continuity.values()],detail});
+      throw new Error('Replica batch removal failed: '+removed+' count='+identities.length+' seq='+seq+'; '+detail);
+    }
+    return removed;
+  }
+  for(const ident of plan.remove){
+    const generation=continuity.get(ident);
+    const removed=generation && generation.length===3?replicaReplacementRemover(zone,ident,generation[1],generation[2]):replicaRemover(zone,ident);
+    if(removed<0)throw new Error('Replica removal failed: '+removed+' id=0x'+ident.toString(16));
+  }
+}
+function comparisonViewSettings(value){
+  if(value===undefined || value===null)return null;
+  if(typeof value!=='object' || Array.isArray(value) || Object.keys(value).sort().join(',')!=='ident,zoom' ||
+     ![0x70000001,0x70000002].includes(value.ident) || !Number.isFinite(value.zoom) ||
+     !(Math.fround(value.zoom)>0) || !Number.isFinite(Math.fround(value.zoom)))throw new Error('Invalid comparison view fixture');
+  return {ident:value.ident,zoom:Math.fround(value.zoom)};
+}
+function comparisonFrameLimitSettings(value,view){
+  if(value===undefined || value===false)return false;
+  if(value!==true || !view)throw new Error('Comparison frame limit requires the comparison view fixture');
+  return true;
+}
+function ensureMotionTraceReader(){
+  if(!motionTraceReader){
+    motionTraceReader=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedPresentedMotionTrace'),'int',['pointer','pointer']);
+    motionTraceBuffer=Memory.alloc(42*8);
+  }
+}
+function applyComparisonView(zone,view,context){
+  if(!comparisonViewConfig || !loaded)return view;
+  const viewport=Array.from({length:4},(_,i)=>view.add(i*4).readFloat());
+  if(viewport.some(value=>!Number.isFinite(value) || value<=0))throw new Error('Invalid comparison view viewport');
+  ensureMotionTraceReader();
+  const count=motionTraceReader(zone,motionTraceBuffer);let status='target',focus=null;
+  if(count===-7){
+    comparisonViewCounts.busy++;status='busy';
+  }
+  else if(count<0)throw new Error('Native comparison view trace failed: '+count);
+  else {
+    for(let row=0;count>0 && row<2;row++){
+      const data=motionTraceBuffer.add(row*20*8);if(data.readDouble()!==comparisonViewConfig.ident)continue;
+      const x=data.add(16*8).readDouble()+motionTraceBuffer.add(40*8).readDouble();
+      const y=data.add(17*8).readDouble()+motionTraceBuffer.add(41*8).readDouble();
+      if(!Number.isFinite(x) || !Number.isFinite(y))throw new Error('Invalid comparison view render position');
+      focus={x,y,atMs:data.add(2*8).readDouble()};break;
+    }
+    if(!focus){comparisonViewCounts.missing++;status='missing';}
+  }
+  if(!focus){
+    // Trace freshness can hide a live root when source poses stall. Keep the
+    // private comparison camera on a freshly validated actual render point;
+    // otherwise falling back to the native camera manufactures a zoom/pan
+    // discontinuity in the recording. A genuinely absent root stays native.
+    if(!comparisonFocusReader){
+      const dll=Process.getModuleByName('RepopulatedDiagnostic.dll');
+      comparisonFocusReader=new NativeFunction(dll.getExportByName('RepopulatedReadComparisonFocus'),'int',['pointer','uint','pointer']);
+      comparisonFocusBuffer=Memory.alloc(16);
+      if(!presentationStageClock)presentationStageClock=new NativeFunction(dll.getExportByName('RepopulatedMonotonicMillis'),'double',[]);
+    }
+    comparisonViewCounts.focusReads++;
+    const result=comparisonFocusReader(zone,comparisonViewConfig.ident,comparisonFocusBuffer);
+    if(result===1){
+      const x=comparisonFocusBuffer.readDouble(),y=comparisonFocusBuffer.add(8).readDouble();
+      if(!Number.isFinite(x) || !Number.isFinite(y))throw new Error('Invalid comparison view fallback render position');
+      focus={x,y,atMs:presentationStageClock()};status='target-'+status;
+    }else if(result!==0)throw new Error('Native comparison focus failed: '+result);
+  }
+  comparisonFocus=focus;
+  if(!focus){
+    comparisonViewCounts.fallbacks++;
+    context.comparisonView=lastComparisonView={ident:comparisonViewConfig.ident,status:'fallback-native-'+status,applied:false,
+        x:view.add(0x10).readFloat(),y:view.add(0x14).readFloat(),zoom:view.add(0x20).readFloat(),
+        orientation:[view.add(0x28).readFloat(),view.add(0x2c).readFloat()],viewport,
+        frameLimit:comparisonFrameLimit?60:null,counts:{...comparisonViewCounts}};
+    return view;
+  }
+  const copy=Memory.alloc(72);copy.writeByteArray(view.readByteArray(72));
+  copy.add(0x10).writeFloat(comparisonFocus.x);copy.add(0x14).writeFloat(comparisonFocus.y);
+  copy.add(0x18).writeFloat(0);copy.add(0x1c).writeFloat(0);copy.add(0x20).writeFloat(comparisonViewConfig.zoom);
+  copy.add(0x28).writeFloat(1);copy.add(0x2c).writeFloat(0);
+  comparisonViewCounts.applied++;context.spectatorView=copy;
+  context.comparisonView=lastComparisonView={ident:comparisonViewConfig.ident,status,applied:true,x:copy.add(0x10).readFloat(),y:copy.add(0x14).readFloat(),
+      zoom:copy.add(0x20).readFloat(),orientation:[copy.add(0x28).readFloat(),copy.add(0x2c).readFloat()],
+      sourceAtMs:comparisonFocus.atMs,viewport,frameLimit:comparisonFrameLimit?60:null,counts:{...comparisonViewCounts}};
+  return copy;
+}
+function tracePresentation(zone,view,comparisonFrame=null){
+  if(!(cfg.testSmoothFlight || cfg.measureMotion || thrustAuditIdent) || !loaded || Date.now()-lastMotionTrace<33)return;
+  lastMotionTrace=Date.now();ensureMotionTraceReader();
+  const count=motionTraceReader(zone,motionTraceBuffer);if(count===-7){traceBusySkips++;reportThrustAudit();return;}if(count<0)throw new Error('Native motion trace failed');
+  const center=[motionTraceBuffer.add(40*8).readDouble(),motionTraceBuffer.add(41*8).readDouble()];reportThrustAudit(center);
+  if(!count || !(cfg.testSmoothFlight || cfg.measureMotion))return;
+  const rows=Array.from({length:2},(_,row)=>Array.from({length:20},(_,column)=>motionTraceBuffer.add((row*20+column)*8).readDouble()));
+  send({type:'presentation-trace',emittedAtMs:Date.now(),frame:displayFrames,thread:Process.getCurrentThreadId(),
+        simTimeSeconds:zone.add(0x158).readFloat(),view:{x:view.add(0x10).readFloat(),y:view.add(0x14).readFloat(),zoom:view.add(0x20).readFloat()},
+        center,rows,presentationDelayMs,visualFrameSeq:lastVisualFrame?lastVisualFrame.seq:0,healthFrameSeq:lastHealthFrame?lastHealthFrame.seq:0,
+        viewSourceTimeMs:viewSourceTimeReader?viewSourceTimeReader():null,
+        comparisonView:comparisonFrame,
+        presentationStages:cfg.measureMotion?{camera:lastCameraPresentationStage,draw:lastDrawPresentationStage}:null,
+        fixture:cfg.testSmoothFlight?{phase:smoothFlightPhase,cycle:smoothFlightCycle,elapsedSeconds:smoothFlightStarted?(Date.now()-smoothFlightStarted)/1000:0}:null});
+}
 const pilotKeys=new Set();
 let mouseOffset=null,mouseHeld=false,mouseX=0,mouseY=0,mouseWindow=null,getWindow=null,getWindowSize=null;
 let textInputActive=null;
 const openEditors=new Set();
 if(cfg.nativeCampaignClient){
+  // The stock camera follows Body's render point. Prepare that point before
+  // its follow routine computes the View, rather than only in DrawGame after
+  // the camera has already read a newly received authoritative pose.
+  const cameraFollow=game.base.add(0xf51e0),cameraPrefix=[0x48,0x8b,0xc4,0x48,0x89,0x58,0x10,0x48,0x89,0x70,0x18];
+  const cameraActual=new Uint8Array(cameraFollow.readByteArray(cameraPrefix.length));
+  if(cameraPrefix.some((byte,i)=>cameraActual[i]!==byte))throw new Error('Native camera follow signature differs');
+  Interceptor.attach(cameraFollow,{onEnter(args){
+    if(!campaignReplicaZone || !args[1].equals(campaignReplicaZone))return;
+    nativeCameraThread=Process.getCurrentThreadId();
+    if(cfg.fastMotion && nativeUpdateThread===Process.getCurrentThreadId())consumeMotion(args[1]);
+    presentReplica(args[1],'camera');
+  }});
   Interceptor.attach(game.base.add(0xa77f0),{onEnter(){nativeMapRenders++;}});
   const markPrefix=[0x48,0x8b,0xc4,0x48,0x89,0x58,0x18,0x55,0x56,0x57];
   const markActual=new Uint8Array(game.base.add(0xfea60).readByteArray(markPrefix.length));
@@ -173,6 +799,7 @@ if(cfg.nativeCampaignClient){
   }});
   // GSFly's native update distinguishes the active flight state from overlays.
   nativeUIHeartbeat=()=>{
+    nativeHeartbeatCalls++;
     if(!nativeFlightState || heartbeatBusy)return;
     heartbeatBusy=true;
     try{
@@ -186,20 +813,21 @@ if(cfg.nativeCampaignClient){
         testNativeModal=list.add(8).readPointer().add(list.add(0x70).readS32()*8).readPointer();
         if(testNativeModal.equals(state))throw new Error('Native menu test did not activate overlay');
         testNativeMenuAt=Date.now();testNativeMenuStage++;
-        send({type:'native-menu-test',action:'opened',tab,displayFrames,nativeMapRenders,menuSnapshotApplies,thread:Process.getCurrentThreadId(),nativeUpdateThread});
+        send({type:'native-menu-test',action:'opened',tab,displayFrames,nativeMapRenders,menuSnapshotApplies,motionApplied,thread:Process.getCurrentThreadId(),nativeUpdateThread});
       }else if([1,3].includes(testNativeMenuStage) && Date.now()-testNativeMenuAt>=2000){
         const list=testNativeModal.add(0x10).readPointer();
         const current=list.add(8).readPointer().add(list.add(0x70).readS32()*8).readPointer();
         if(!current.equals(testNativeModal))throw new Error('Native menu test lost active modal');
         new NativeFunction(game.base.add(0x118070),'void',['pointer','pointer','float'])(list,testNativeModal,0.5);
-        send({type:'native-menu-test',action:'closed',tab:testNativeMenuStage===1?1:0x10,displayFrames,nativeMapRenders,menuSnapshotApplies,thread:Process.getCurrentThreadId(),nativeUpdateThread});
+        send({type:'native-menu-test',action:'closed',tab:testNativeMenuStage===1?1:0x10,displayFrames,nativeMapRenders,menuSnapshotApplies,motionApplied,thread:Process.getCurrentThreadId(),nativeUpdateThread});
         testNativeModal=null;testNativeMenuStage++;
       }
     }
     const active=topState(state);if(active!==nativeFlightActive){nativeFlightActive=active;if(lastNativeIntent)sendNativeIntent(lastNativeIntent);}
-    if(!active && campaignReplicaZone){
+    if(campaignReplicaZone && nativeUpdateThread!==null){
       if(Process.getCurrentThreadId()!==nativeUpdateThread)throw new Error('Native UI update thread differs from replica update thread');
-      applyingFromMenu=true;try{sample(campaignReplicaZone);}finally{applyingFromMenu=false;}
+      consumeMotion(campaignReplicaZone,'ui');
+      if(!active){applyingFromMenu=true;try{sample(campaignReplicaZone);}finally{applyingFromMenu=false;}}
     }
     }finally{heartbeatBusy=false;}
   };
@@ -215,29 +843,36 @@ if(cfg.renderOnly) {
   // initialization so rewritten entry stubs cannot discard the hooks.
   Interceptor.attach(game.getExportByName('?DrawGame@GameZone@@QEAAXAEBUView@@@Z'),{onEnter(args){
     if(cfg.nativeCampaignClient && campaignReplicaZone && !args[0].equals(campaignReplicaZone))return;
+    this.motionTraceZone=args[0];this.motionTraceView=args[1];
+    nativeDrawThread=Process.getCurrentThreadId();
     drawCalls++;
+    // Apply frequent state at a render boundary as well when native flight
+    // and rendering run on the same verified game thread.
+    if(cfg.fastMotion && nativeUpdateThread===Process.getCurrentThreadId())consumeMotion(args[0]);
     if(visualTick && visualTick(args[0])<0) throw new Error('Native visual effect replay failed');
-    if(replicaPresenter && replicaPresentedAt) {
-      const predicted=replicaPresenter(args[0],Math.min(0.25,Math.max(0,(Date.now()-replicaPresentedAt)/1000)),cfg.followPilot,presentedPilot);
-      if(predicted<0) throw new Error('Replica presentation failed: '+predicted);
-      if(predicted>0) {replicaPilot=[presentedPilot.readFloat(),presentedPilot.add(4).readFloat()];predictedFrames++;}
-    }
-    if(cfg.followPilot && replicaPilot) {
+    presentReplica(args[0],'draw');
+    if(cfg.followPilot && replicaPilot && !cfg.nativeCampaignClient && !comparisonViewConfig) {
       // View offsets are checked against DrawGame's current machine code and
       // live viewport values; this is the replica camera, never host state.
       args[1].add(0x10).writeFloat(replicaPilot[0]);
       args[1].add(0x14).writeFloat(replicaPilot[1]);
-      if(!cfg.nativeCampaignClient)args[1].add(0x20).writeFloat(2);
+      args[1].add(0x20).writeFloat(2);
     }
     if(drawCalls%60===1) lastView=Array.from({length:18},(_,i)=>args[1].add(i*4).readFloat());
+    if(comparisonViewConfig){args[1]=applyComparisonView(args[0],args[1],this);this.motionTraceView=args[1];}
     if(sdlHooksInstalled) return;
     sdlHooksInstalled=true;
     const sdl=Process.getModuleByName('SDL2.dll');
     getWindow=new NativeFunction(sdl.getExportByName('SDL_GetWindowFromID'),'pointer',['uint']);
     getWindowSize=new NativeFunction(sdl.getExportByName('SDL_GetWindowSize'),'void',['pointer','pointer','pointer']);
     textInputActive=new NativeFunction(sdl.getExportByName('SDL_IsTextInputActive'),'int',[]);
-    const pace=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedPaceFrame'),'void',[]);
-    Interceptor.attach(sdl.getExportByName('SDL_GL_SwapWindow'),{onEnter(){
+    const pace=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedPaceFrame'),'void',[],{scheduling:'cooperative'});
+    let titleSet=false;
+    const setTitle=new NativeFunction(sdl.getExportByName('SDL_SetWindowTitle'),'void',['pointer','pointer']);
+    const sessionTitle=Memory.allocUtf8String(cfg.windowTitle || (cfg.nativeCampaignClient?'Reassembly — Repopulated Client':'Reassembly — Repopulated Host'));
+    Interceptor.attach(sdl.getExportByName('SDL_GL_SwapWindow'),{onEnter(args){
+      nativeSwapThread=Process.getCurrentThreadId();
+      if(!titleSet){setTitle(args[0],sessionTitle);titleSet=true;}
       if(cfg.frameLimit)pace();
       const now=Date.now();displayFrames++;
       if(lastPresentation) {const ms=now-lastPresentation;frameHistogram[Math.min(250,ms)]++;if(ms>50)longFrames++;maxFrameMs=Math.max(maxFrameMs,ms);}
@@ -273,20 +908,36 @@ if(cfg.renderOnly) {
     }
     });
     send({type:'sdl-input-ready'});
-  }});
-  if(cfg.measureRendering) Interceptor.attach(game.getExportByName('?render@Block@@QEBAXPEAU?$MeshPair@UVertexPos2ColorTime@@UVertexPosColor@@@@@Z'),{
-    onEnter(args) {
-      if(!clusterIdent) return;
-      const cluster=args[0].add(0xb8).readPointer();
-      if(!cluster.isNull() && clusterIdent(cluster)===cfg.followPilot) pilotRenderCalls++;
-    }
-  });
+  },onLeave(){if(this.motionTraceZone)tracePresentation(this.motionTraceZone,this.motionTraceView,this.comparisonView || null);}});
+}
+if(!cfg.renderOnly && (cfg.measureRendering || cfg.windowTitle || comparisonViewConfig)){
+  let hostSdlHooksInstalled=false;
+  Interceptor.attach(game.getExportByName('?DrawGame@GameZone@@QEAAXAEBUView@@@Z'),{onEnter(args){
+    this.motionTraceZone=args[0];this.motionTraceView=args[1];drawCalls++;
+    nativeDrawThread=Process.getCurrentThreadId();
+    capturePresentationStage('draw');
+    if(comparisonViewConfig){args[1]=applyComparisonView(args[0],args[1],this);this.motionTraceView=args[1];}
+    if(hostSdlHooksInstalled)return;hostSdlHooksInstalled=true;
+    const sdl=Process.getModuleByName('SDL2.dll');
+    const setTitle=new NativeFunction(sdl.getExportByName('SDL_SetWindowTitle'),'void',['pointer','pointer']);
+    const comparisonPace=comparisonFrameLimit?new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedPaceFrame'),'void',[]):null;
+    const title=Memory.allocUtf8String(cfg.windowTitle || 'Reassembly — Repopulated Host');let titleSet=false;
+    Interceptor.attach(sdl.getExportByName('SDL_GL_SwapWindow'),{onEnter(args){
+      nativeSwapThread=Process.getCurrentThreadId();
+      if(!titleSet){setTitle(args[0],title);titleSet=true;}
+      if(comparisonPace)comparisonPace();
+      const now=Date.now();displayFrames++;
+      if(lastPresentation){const ms=now-lastPresentation;frameHistogram[Math.min(250,ms)]++;if(ms>50)longFrames++;maxFrameMs=Math.max(maxFrameMs,ms);}
+      lastPresentation=now;
+    }});
+  },onLeave(){if(this.motionTraceZone)tracePresentation(this.motionTraceZone,this.motionTraceView,this.comparisonView || null);}});
 }
 let damageFixture=null,damagedFixture=false;
 let partialDamageFixture=null,partiallyDamagedFixture=false;
 let healthReader=null;
 let driver=null,aimDriver=null,lastRemoteRespawn=0,remoteDestroyed=false;
 let nativeDriver=null,nativeWeapons=null;
+const nativeWeaponPulses=new Map();
 let remoteControlEnabled=!cfg.vacantRemoteAI;
 let vacantAICalls=0;
 let campaignSaveProbed=false;
@@ -348,8 +999,26 @@ function pilotHealth(zone) {
   if(count<1)throw new Error('Pilot health unavailable: '+count);
   return [{ident:0x70000002,values:Array.from({length:count},(_,i)=>buffer.add(i*4).readFloat()).sort((a,b)=>a-b)}];
 }
-rpc.exports = { enqueue(command) {
+rpc.exports = { applymotion(frame){
+  if(!cfg.fastMotion || !Number.isInteger(frame.seq) || frame.seq<=motionSequence || typeof frame.poses!=='string' || !frame.poses.length || frame.poses.length%88 || frame.poses.length>4096*88 || !/^[a-f0-9]+$/.test(frame.poses))throw new Error('Invalid native motion frame');
+  const started=Date.now();
+  if(lastMotionPrepared)timing('prepareInterval',started-lastMotionPrepared);lastMotionPrepared=started;
+  const received=Number.isFinite(frame.receivedAt)?Math.min(started,frame.receivedAt):started;
+  timing('receiveToPrepare',started-received);
+  if(!Number.isSafeInteger(frame.sourceTimeMs) || frame.sourceTimeMs<=0 || frame.sourceTimeMs>1e12)throw new Error('Invalid native motion source time');
+  if(!Number.isSafeInteger(frame.simTimeMs) || frame.simTimeMs<0 || frame.simTimeMs>1e12)throw new Error('Invalid native simulation time');
+  const prepared={seq:frame.seq,buffer:packedBuffer(frame.poses),count:frame.poses.length/88,received,inputTick:frame.inputTick,sourceTimeMs:frame.sourceTimeMs,simTimeMs:frame.simTimeMs};
+  for(const [key,size,limit] of [['blocks',56,4096],['projectiles',36,2048],['movers',16,4096],['health',16,65536]]){
+    const hex=frame[key];if(typeof hex!=='string' || hex.length%(size*2) || hex.length>limit*size*2 || hex.length && !/^[a-f0-9]+$/.test(hex))throw new Error('Invalid realtime '+key);
+    prepared[key]={buffer:packedBuffer(hex),count:hex.length/(size*2)};
+  }
+  motionSequence=frame.seq;queueMotionFrame(prepared);retainVisualFrame(preparedVisualFrames,prepared);
+  timing('motionPrepare',Date.now()-started);return true;
+}, enqueue(command) {
   if (!cfg.networkControl) throw new Error('Network controls unavailable');
+  if(command.action==='native')for(const row of command.weapons){
+    if(row[1] && (nativeWeaponPulses.has(row[0]) || nativeWeaponPulses.size<512))nativeWeaponPulses.set(row[0],{mask:(nativeWeaponPulses.get(row[0])?.mask || 0)|row[1],received:Date.now()});
+  }
   // Start the test pause after real input has flowed, rather than during loading.
   if(cfg.holdControlsMs && !controlHoldStarted && ++receivedControls>=20){
     controlHoldStarted=true;holdControlsUntil=Date.now()+cfg.holdControlsMs;
@@ -363,9 +1032,9 @@ rpc.exports = { enqueue(command) {
   if(pendingMoves.length>=32) {droppedControls++;return false;}
   pendingMoves.push({...command,queuedAt:Date.now()}); return true;
 }, controlstats() {return {pending:pendingMoves.length,coalesced:coalescedControls,dropped:droppedControls,peak:peakPendingControls,playerControlled:remoteControlEnabled,vacantAICalls,
-  testHoldStarted:controlHoldStarted,testHoldCompleted:controlHoldStarted && Date.now()>=holdControlsUntil};}, setremotecontrol(enabled) {
+  testHoldStarted:controlHoldStarted,testHoldCompleted:controlHoldStarted && Date.now()>=holdControlsUntil,hostAI:hostAIStats,nativeAIInstalled:hostAIOwnedCallback!==null};}, setremotecontrol(enabled) {
   if(!cfg.vacantRemoteAI || typeof enabled!=='boolean') throw new Error('Remote ownership unavailable');
-  remoteControlEnabled=enabled;pendingMoves.length=0;driveStates.clear();fireStates.clear();
+  remoteControlEnabled=enabled;pendingMoves.length=0;driveStates.clear();fireStates.clear();nativeWeaponPulses.clear();
   send({type:'remote-ownership',playerControlled:enabled});return true;
 }, checkpoint(request) {
   if(!cfg.campaignCheckpoints || pendingCheckpoint || typeof request.id!=='string' || !/^[a-f0-9]{32}$/.test(request.id) ||
@@ -373,6 +1042,7 @@ rpc.exports = { enqueue(command) {
      request.path.replaceAll('\\','/')!==cfg.sandbox.replaceAll('\\','/')+'/checkpoint-'+request.id) throw new Error('Invalid private checkpoint request');
   pendingCheckpoint=request;return true;
 }, applyworld(world) {
+  const prepareStarted=Date.now();
   if(!cfg.worldReplica || !Number.isSafeInteger(world.seq) || world.seq<=worldSeq ||
      typeof world.path!=='string' || world.path.includes('..') ||
      !world.path.replaceAll('\\','/').startsWith(cfg.sandbox.replaceAll('\\','/')+'/')) throw new Error('Invalid world update');
@@ -380,6 +1050,7 @@ rpc.exports = { enqueue(command) {
     const plan=world.incremental;
     if(!plan || typeof world.hasAdditions!=='boolean' || !Array.isArray(plan.remove) || plan.remove.length>4096 ||
        new Set(plan.remove).size!==plan.remove.length || plan.remove.some(id=>!Number.isInteger(id)||id<=0||id>0xffffffff))throw new Error('Invalid incremental removals');
+    replicaContinuity(plan);
     for(const [key,size,limit] of [['poses',40,4096],['health',16,65536]]){
       const hex=plan[key];if(typeof hex!=='string'||!hex.length||hex.length%(size*2)||hex.length>size*limit*2||!/^[a-f0-9]+$/.test(hex))throw new Error('Invalid incremental state');
     }
@@ -400,7 +1071,12 @@ rpc.exports = { enqueue(command) {
       if(typeof value!=='string' || value.length%(size*2) || value.length>size*sizes[key][1]*2 || !/^[a-f0-9]*$/.test(value))throw new Error('Invalid packed presentation state');
     }
   }
-  worldSeq=world.seq; pendingWorld=world; return true;
+  if(cfg.persistentReplica){
+    const plan=world.incremental;
+    world.preparedIncremental={poses:{buffer:packedBuffer(plan.poses),count:plan.poses.length/80},
+                               health:{buffer:packedBuffer(plan.health),count:plan.health.length/32}};
+  }
+  worldSeq=world.seq; pendingWorld=world; timing('worldPrepare',Date.now()-prepareStarted);return true;
 }, applystate(state) {
   if (!cfg.replica || !Number.isSafeInteger(state.seq) || state.seq <= stateSeq ||
       !Array.isArray(state.ships) || !state.ships.length || state.ships.length>4096) throw new Error('Invalid replica state');
@@ -417,8 +1093,24 @@ rpc.exports = { enqueue(command) {
   }
   stateSeq = state.seq; pendingState = state; return true;
 }};
+function receiveStream(){
+  recv('repopulated-stream',message=>{
+    try{
+      const {kind,value}=message.payload;
+      streamStats[kind]=(streamStats[kind] || 0)+1;const started=Date.now();
+      if(kind==='input')rpc.exports.enqueue(value);
+      else if(kind==='motion')rpc.exports.applymotion(value);
+      else if(kind==='world')rpc.exports.applyworld(value);
+      else throw new Error('Unknown native stream message');
+      streamStats.maxPrepareMs=Math.max(streamStats.maxPrepareMs,Date.now()-started);
+    }catch(error){send({type:'error',description:String(error),stack:error.stack});}
+    receiveStream();
+  });
+}
+receiveStream();
 const kernel = Process.getModuleByName('KERNEL32.dll');
-if(cfg.worldReplica) Interceptor.attach(game.base.add(0xcab60), {
+let monotonicClock=null;
+if(cfg.worldReplica && !cfg.nativeCampaignClient) Interceptor.attach(game.base.add(0xcab60), {
   onEnter(args) { consoleContext=args[0]; }
 });
 if (cfg.traceFiles) for (const name of ['CreateFileW','CreateFileA','GetFileAttributesW','GetFileAttributesA']) {
@@ -445,8 +1137,13 @@ function dispatchControls(zone) {
       } else if(command.action==='native'){
         command.nativeDestination=Memory.alloc(24);command.destination.forEach((v,i)=>command.nativeDestination.add(i*4).writeFloat(v));
         command.nativePrecision=Memory.alloc(16);command.precision.forEach((v,i)=>command.nativePrecision.add(i*4).writeFloat(v));
-        command.nativeWeaponBuffer=Memory.alloc(Math.max(1,command.weapons.length*28));
-        command.weapons.forEach((row,i)=>row.forEach((v,j)=>{const cell=command.nativeWeaponBuffer.add(i*28+j*4);if(j<2)cell.writeU32(v);else cell.writeFloat(v);}));
+        command.nativeWeaponBuffer=Memory.alloc(Math.max(1,command.weapons.length*32));
+        command.weapons.forEach((row,i)=>row.forEach((v,j)=>{const cell=command.nativeWeaponBuffer.add(i*32+j*4);if(j<2)cell.writeU32(v);else cell.writeFloat(v);}));
+        latestInputSequence=command.seq;
+        latestInputTick=command.clientTick;
+        if(typeof command.viewRadius==='number'){
+          if(command.viewRadius>=clientViewRadius || Date.now()-clientViewChangedAt>2000){clientViewRadius=command.viewRadius;clientViewChangedAt=Date.now();}
+        }
         driveStates.set(command.ownerFaction,{...command,received:command.queuedAt});
         fireStates.set(command.ownerFaction,{...command,received:command.queuedAt,report:true});
         send({type:'network-drive-result',seq:command.seq,result:driveCommand(zone,command,Date.now()-command.queuedAt>500)});
@@ -491,7 +1188,10 @@ function sample(zone) {
       if (!redirects) { send({type:'isolation-not-confirmed'}); return; }
       const dll = load(Memory.allocUtf16String(cfg.dll));
       if (dll.isNull()) throw new Error('Diagnostic DLL load failed');
-      sampler = new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedSample'), 'int', ['pointer']);
+      sampler = new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName(cfg.diagnosticSamples===false?'RepopulatedCountNativeClusters':'RepopulatedSample'), 'int', ['pointer']);
+      installWireHex(Process.getModuleByName('RepopulatedDiagnostic.dll'));
+      const ownershipExport=Process.getModuleByName('RepopulatedDiagnostic.dll').findExportByName('RepopulatedOwnershipStats');
+      if(ownershipExport){ownershipStatsReader=new NativeFunction(ownershipExport,'void',['pointer']);ownershipStatsBuffer=Memory.alloc(32);}
       clusterIdent = new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedClusterIdent'),'uint',['pointer']);
       ensureIdent = new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedEnsureClusterIdent'),'uint',['pointer','uint']);
       if(cfg.worldStream || cfg.worldReplica) worldExporter=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedExportWorld'),'int',['pointer','pointer']);
@@ -506,8 +1206,19 @@ function sample(zone) {
         const dll=Process.getModuleByName('RepopulatedDiagnostic.dll');
         replicaUpdater=new NativeFunction(dll.getExportByName('RepopulatedUpdateReplica'),'int',['pointer','pointer','int','pointer','int']);
         replicaRemover=new NativeFunction(dll.getExportByName('RepopulatedRemoveReplica'),'int',['pointer','uint']);
+        replicaReplacementRemover=new NativeFunction(dll.getExportByName('RepopulatedRemoveReplicaForReplacement'),'int',['pointer','uint','uint','int']);
+        const fragmentExport=dll.findExportByName('RepopulatedRemoveReplicaForFragmentReplacement');
+        if(fragmentExport)replicaFragmentReplacementRemover=new NativeFunction(fragmentExport,'int',['pointer','uint','uint']);
+        const replacementStatsExport=dll.findExportByName('RepopulatedReplacementStats');
+        if(replacementStatsExport){replacementStatsReader=new NativeFunction(replacementStatsExport,'void',['pointer']);replacementStatsBuffer=Memory.alloc(64);}
+        if(cfg.nativeCampaignClient){
+          replicaBatchRemover=new NativeFunction(dll.getExportByName('RepopulatedRemoveReplicaBatch'),'int',['pointer','pointer','int']);
+          const batchMessageExport=dll.findExportByName('RepopulatedRemoveReplicaBatchMessage');
+          if(batchMessageExport)replicaBatchMessage=new NativeFunction(batchMessageExport,'pointer',[]);
+        }
         replicaStats=new NativeFunction(dll.getExportByName('RepopulatedReplicaStats'),'void',['pointer']);
       }
+      if(cfg.nativeCampaignClient)installReplicaField(Process.getModuleByName('RepopulatedDiagnostic.dll'),zone);
       if(cfg.worldReplica) worldLoadMessage=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedWorldLoadMessage'),'pointer',[]);
       if(cfg.syncCampaignMap){
         const module=Process.getModuleByName('RepopulatedDiagnostic.dll');
@@ -528,11 +1239,16 @@ function sample(zone) {
         const module=Process.getModuleByName('RepopulatedDiagnostic.dll');
         visualExporter=new NativeFunction(module.getExportByName('RepopulatedExportPresentation'),'int',['pointer','pointer','uint','float']);
         visualIdentities=new NativeFunction(module.getExportByName('RepopulatedEnsureVisualIdentities'),'int',['pointer']);
+      }
+      if(thrustAuditIdent && !cfg.renderOnly)installHostThrustAudit(Process.getModuleByName('RepopulatedDiagnostic.dll'));
+      if(cfg.streamPresentation && !cfg.streamMotion || thrustAuditIdent && !cfg.renderOnly){
+        const module=Process.getModuleByName('RepopulatedDiagnostic.dll');
         const effect=game.base.add(0x1cc440),prefix=[0x48,0x8b,0xc4,0x48,0x89,0x58,0x08,0x55,0x48,0x8d,0x68,0xc1];
         const actual=new Uint8Array(effect.readByteArray(prefix.length));
         if(prefix.some((b,i)=>actual[i]!==b)) throw new Error('Native thrust signature differs');
         const original=Interceptor.replaceFast(effect,module.getExportByName('RepopulatedCaptureThrust'));
-        new NativeFunction(module.getExportByName('RepopulatedSetThrustOriginal'),'void',['pointer'])(original);
+        try{new NativeFunction(module.getExportByName('RepopulatedSetThrustOriginal'),'void',['pointer'])(original);}
+        catch(error){Interceptor.revert(effect);throw error;}
       }
       if(cfg.damageTest) damageFixture=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedDamageFixture'),'int',['pointer','int']);
       if(cfg.damageTest || cfg.verifyPilotHealth) partialDamageFixture=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedPartialDamageFixture'),'int',['pointer','int']);
@@ -549,7 +1265,7 @@ function sample(zone) {
       if(cfg.activeShips) fireShip=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedFireShip'),'int',['pointer','int','int','uint','float','float']);
       if(cfg.activeShips) releaseWeapons=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedReleaseWeapons'),'int',['pointer','int','uint']);
       if (cfg.exportCluster || cfg.exportFactions) exporter = new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedExportCluster'), 'int', ['pointer','int']);
-      loaded = true; send({type:'sampler-loaded'});
+      loaded = true; send({type:'sampler-loaded',diagnosticSamples:cfg.diagnosticSamples!==false});
     }
     const result = sampler(zone); sampled++;
     if(cfg.replica && cfg.initialIdentities && !initialBindingsApplied && result>=cfg.initialIdentities.length) {
@@ -597,9 +1313,13 @@ function sample(zone) {
       }
     }
     if(worldExporter && cfg.worldStream) {
+      const sceneExportStarted=Date.now();
       if(visualIdentities && visualIdentities(zone)<0)throw new Error('Native visual identity assignment failed');
       const path=cfg.sandbox+'/world-'+(cfg.rollingWorld?sampled%16:sampled)+'.lua';
-      let roots=interestExporter?interestExporter(zone,Memory.allocUtf8String(path),cfg.interestIdent,cfg.interestRadius || 3000):worldExporter(zone,Memory.allocUtf8String(path));
+      const radius=cfg.dynamicInterest?Math.min(20000,clientViewRadius+1500):cfg.interestRadius || 3000;
+      let exportStage=Date.now();
+      let roots=interestExporter?interestExporter(zone,Memory.allocUtf8String(path),cfg.interestIdent,radius):worldExporter(zone,Memory.allocUtf8String(path));
+      timing('worldExport',Date.now()-exportStage);
       if(roots===-10 && cfg.remoteRespawn && Date.now()-lastRemoteRespawn>2000) {
         lastRemoteRespawn=Date.now();
         const save=game.base.add(0x3cf700).readPointer(),player=game.base.add(0x3cf930).readPointer();
@@ -619,25 +1339,30 @@ function sample(zone) {
         driveStates.clear();fireStates.clear();
         ensureSceneIdentities(zone);
         if(visualIdentities && visualIdentities(zone)<0)throw new Error('Respawn visual identity assignment failed');
-        roots=interestExporter(zone,Memory.allocUtf8String(path),cfg.interestIdent,cfg.interestRadius || 3000);
+        roots=interestExporter(zone,Memory.allocUtf8String(path),cfg.interestIdent,radius);
       }
       let visualPath=null;
       if(visualExporter && roots>=0) {
-        visualPath=cfg.sandbox+'/visual-'+sampled%16+'.json';
-        const visuals=visualExporter(zone,Memory.allocUtf8String(visualPath),cfg.interestIdent,cfg.interestRadius || 2000);
+        exportStage=Date.now();
+        visualPath=cfg.sandbox+'/visual-'+(cfg.rollingWorld?sampled%16:sampled)+'.json';
+        const visuals=visualExporter(zone,Memory.allocUtf8String(visualPath),cfg.interestIdent,radius);
         if(visuals<0) {
           const message=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedPresentationMessage'),'pointer',[])().readUtf8String();
           throw new Error('Native presentation export failed: '+visuals+' '+message);
         }
+        timing('visualExport',Date.now()-exportStage);
       }
       let mapPath=null,remoteMapPath=null;
       if(campaignMapExporter && roots>=0){
+        exportStage=Date.now();
         const explored=campaignMapExplore(zone);if(explored<0)throw new Error('Remote map exploration failed: '+explored);
-        mapPath=cfg.sandbox+'/map-'+sampled%16+'.json';
+        mapPath=cfg.sandbox+'/map-'+(cfg.rollingWorld?sampled%16:sampled)+'.json';
         const cells=campaignMapExporter(zone,Memory.allocUtf8String(mapPath));if(cells<0)throw new Error('Campaign map export failed: '+cells);
-        remoteMapPath=cfg.sandbox+'/remote-map-'+sampled%16+'.json';
+        remoteMapPath=cfg.sandbox+'/remote-map-'+(cfg.rollingWorld?sampled%16:sampled)+'.json';
         if(campaignMapRemoteExporter(zone,Memory.allocUtf8String(remoteMapPath))!==cells)throw new Error('Remote faction map export failed');
+        timing('mapExport',Date.now()-exportStage);
       }
+      timing('sceneExport',Date.now()-sceneExportStarted);
       send({type:'world-exported',seq:sampled,path,roots,visualPath,mapPath,remoteMapPath,runtimeHealth:cfg.skipHealth?[]:runtimeHealth(zone),
         pilotHealth:cfg.verifyPilotHealth && roots>0?pilotHealth(zone):[]});
       if(cfg.testRemoteDeath && sampled>=(cfg.beamFixture?40:20) && !remoteDestroyed) {
@@ -654,31 +1379,47 @@ function sample(zone) {
       partiallyDamagedFixture=true;send({type:'fixture-partial-damage-result',result:partialDamageFixture(zone,cfg.verifyPilotHealth?20008:8)});
     }
     if(worldLoader && pendingWorld && consoleContext) {
+      const sceneToken=trySceneUpdate(zone);
+      if(sceneToken===0){noteMotionDeferred(zone,'geometry');if(sceneIdleGateEnabled && sceneGateReady)lastSample=0;return;}
+      const geometryStarted=Date.now();
       if(applyingFromMenu)menuSnapshotApplies++;
       const world=pendingWorld; pendingWorld=null;
       let clusters;
       let persistentReplica={};
+      let presentation={};
+      let sceneCommitted=false;
+      try{
       if(cfg.persistentReplica){
-        for(const ident of world.incremental.remove){const removed=replicaRemover(zone,ident);if(removed!==1)throw new Error('Replica removal failed: '+removed);}
+        let geometryStage=Date.now();
+        nativeStage('geometry-remove',world.seq);
+        if(cfg.measureMotion){
+          const transitions=(world.incremental.transitions||[]).filter(row=>row.ident===0x70000001||row.ident===0x70000002);
+          if(transitions.length)send({type:'replica-generation',seq:world.seq,atMs:Date.now(),frame:displayFrames,transitions});
+        }
+        applyReplicaRemovals(zone,world.incremental,world.seq);
+        timing('geometryRemove',Date.now()-geometryStage);geometryStage=Date.now();
         if(world.hasAdditions){
-          const streamer=zone.add(0x248).readPointer();
-          // The verified level helper can own a standalone field. A replica
-          // must not inject network ships into the local sector streamer's cache.
-          if(cfg.nativeCampaignClient)zone.add(0x248).writePointer(ptr(0));
-          try{clusters=worldLoader(zone,consoleContext,Memory.allocUtf8String(world.path));}
-          finally{if(cfg.nativeCampaignClient)zone.add(0x248).writePointer(streamer);}
+          nativeStage('geometry-append',world.seq);
+          // The private Console getter owns an isolated field while the real
+          // campaign streamer remains visible to the independent draw thread.
+          clusters=worldLoader(zone,consoleContext,Memory.allocUtf8String(world.path));
         }else clusters=zone.add(0x190).readPointer().sub(zone.add(0x188).readPointer()).toInt32()/8;
+        timing('geometryAppend',Date.now()-geometryStage);geometryStage=Date.now();
         if(clusters>=0){
+          nativeStage('geometry-update',world.seq);
           const plan=world.incremental;
-          const updated=replicaUpdater(zone,packedBuffer(plan.poses),plan.poses.length/80,packedBuffer(plan.health),plan.health.length/32);
+          const prepared=world.preparedIncremental;
+          if(!prepared)throw new Error('Persistent replica state was not prepared');
+          const updated=replicaUpdater(zone,prepared.poses.buffer,prepared.poses.count,prepared.health.buffer,prepared.health.count);
           if(updated<0)throw new Error('Persistent replica update failed: '+updated);
           const stats=Memory.alloc(24);replicaStats(stats);
           persistentReplica={retained:plan.retained,replaced:plan.replaced,totalPoseUpdates:stats.readU64().toNumber(),
             totalRemovals:stats.add(8).readU64().toNumber(),totalHealthUpdates:stats.add(16).readU64().toNumber()};
+          if(cfg.measureMotion){persistentReplica.continuity=plan.continuity||[];persistentReplica.transitions=plan.transitions||[];}
         }
+        timing('geometryRuntimeUpdate',Date.now()-geometryStage);
       }else clusters=worldLoader(zone,consoleContext,Memory.allocUtf8String(world.path));
-      let presentation={};
-      if(visualApply && clusters>=0) {
+      if(visualApply && clusters>=0 && (!cfg.fastMotion || !lastMotion)) {
         const motion=world.visuals.motion;
         const applyMotion=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedApplyReplicaMotion'),'int',['pointer','pointer','int']);
         const moving=applyMotion(zone,packedBuffer(motion),motion.length/16);if(moving<0)throw new Error('Replica angular motion failed: '+moving);
@@ -701,20 +1442,42 @@ function sample(zone) {
         presentation.projectilePass1Calls=projectilePass1Calls;
         presentation.beamStages=Array.from({length:4},(_,i)=>stats.add(40+i*8).readU64().toNumber());
       }
-      replicaPresentedAt=Date.now();
+      if(cfg.fastMotion && visualStats){
+        const stats=Memory.alloc(72);visualStats(stats);
+        presentation={thrustEmissions:stats.readU64().toNumber(),projectileDraws:stats.add(8).readU64().toNumber(),turretsApplied:stats.add(16).readU64().toNumber(),lasersApplied:stats.add(24).readU64().toNumber(),beamRenderCalls:stats.add(32).readU64().toNumber(),localMoverUpdates:localMoverCounter?localMoverCounter().toNumber():0,projectilePass1Calls};
+        presentation.beamStages=Array.from({length:4},(_,i)=>stats.add(40+i*8).readU64().toNumber());
+      }
+      if(!lastMotion)replicaPresentedAt=Date.now();
+      // Geometry frames are older than the small motion stream. Restore the
+      // newest poses immediately after structural/health updates. An acquired
+      // private gate also accepts queued motion: Update entry can miss an idle
+      // window that this Update exit has already acquired for geometry.
+      if(motionApply){
+        if(sceneToken===1 && clusters>=0 && pendingMotion){
+          const frame=pendingMotion;pendingMotion=null;pendingMotionQueuedSince=0;applyMotionFrame(zone,frame,true);lastMotion=frame;
+        }else if(lastMotion)applyMotionFrame(zone,lastMotion,false);
+        if(lastMotion)consumeVisualFrame(zone,true);
+      }
       if(cfg.nativeCampaignClient && clusters>=0){
+        nativeStage('geometry-bind',world.seq);
         const bind=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedBindReplicaPlayer'),'int',['pointer','uint']);
         const bound=bind(zone,cfg.followPilot);if(bound!==1)throw new Error('Native replica player binding failed: '+bound);
       }
+      if(sceneToken===1 && clusters<0)throw new Error('Native gated world loading failed: '+clusters);
+      sceneCommitted=clusters>=0;
+      }finally{endSceneUpdate(zone,sceneToken,sceneCommitted);}
       let campaignMap={};
       if(campaignMapApply && clusters>=0){
+        let mapStage=Date.now();
         const map=world.map;
         const cells=campaignMapApply(zone,packedBuffer(map.radius),map.width,packedBuffer(map.cells),map.width*map.width,packedBuffer(map.regions),map.regions.length/24);
         if(cells<0)throw new Error('Native campaign map apply failed: '+cells);
         const objectives=campaignObjectivesApply(zone,packedBuffer(map.objectives),map.objectives.length/72);
         if(objectives<0)throw new Error('Native campaign objectives apply failed: '+objectives);
+        timing('mapApply',Date.now()-mapStage);mapStage=Date.now();
         const verify=cfg.sandbox+'/verified-map-'+world.seq+'.json';
         if(campaignMapExporter(zone,Memory.allocUtf8String(verify))!==cells)throw new Error('Native campaign map readback failed');
+        timing('mapReadback',Date.now()-mapStage);
         campaignMap={...world.mapSummary,nativeMapRenders,verifiedPath:verify,menuSnapshotApplies};
       }
       let pilotPointer=null;
@@ -729,12 +1492,29 @@ function sample(zone) {
           }
         }
       }
-      const verifiedPath=cfg.sandbox+'/verified-world-'+world.seq+'.lua';
-      const verifiedRoots=clusters>=0?worldExporter(zone,Memory.allocUtf8String(verifiedPath)):-1;
+      const verifiedPath=cfg.fullReplicaReadback!==false?cfg.sandbox+'/verified-world-'+world.seq+'.lua':null;
+      const readbackStarted=Date.now();
+      if(!verifiedPath && !replicaRootCountReader)replicaRootCountReader=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedCountReplicaRoots'),'int',['pointer']);
+      const verifiedRoots=clusters<0?-1:verifiedPath?worldExporter(zone,Memory.allocUtf8String(verifiedPath)):replicaRootCountReader(zone);
+      timing('worldReadback',Date.now()-readbackStarted);
+      if(blockRenderCounter)pilotRenderCalls=blockRenderCounter().toNumber();
+      if(blockRenderCounter && !cfg.nativeCampaignClient)new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedObservePilot'),'void',['pointer','uint'])(zone,cfg.followPilot);
+      let prediction={};if(predictionStats){const stats=Memory.alloc(32);predictionStats(stats);prediction={steps:stats.readDouble(),reconciliations:stats.add(8).readDouble(),maximumCorrection:stats.add(16).readDouble(),tick:stats.add(24).readDouble()};}
+      let motionTimeline={};if(motionTimelineStats){const stats=Memory.alloc(32);motionTimelineStats(stats);motionTimeline={duplicateRows:stats.readDouble(),geometryPoseSkips:stats.add(8).readDouble(),maximumCorrection:stats.add(16).readDouble(),maximumAngleCorrection:stats.add(24).readDouble()};}
+      const presentationBusy={presenterSkips:presenterBusySkips,traceSkips:traceBusySkips};
+      if(presentationGuardStats){const stats=Memory.alloc(24);presentationGuardStats(stats);Object.assign(presentationBusy,{nativePresenterSkips:stats.readDouble(),nativeTraceSkips:stats.add(8).readDouble(),correctedPoseRestorations:stats.add(16).readDouble()});}
+      let interpolation={};if(interpolationStatsReader){const stats=Memory.alloc(40);interpolationStatsReader(stats);interpolation={bracketedRoots:stats.readDouble(),boundedExtrapolations:stats.add(8).readDouble(),startupHolds:stats.add(16).readDouble(),staleFreezes:stats.add(24).readDouble(),bufferResets:stats.add(32).readDouble()};}
+      let framePacing={};if(framePaceStatsReader){const stats=Memory.alloc(64);framePaceStatsReader(stats);framePacing={calls:stats.readDouble(),waits:stats.add(8).readDouble(),timeouts:stats.add(16).readDouble(),failures:stats.add(24).readDouble(),maximumWaitMs:stats.add(32).readDouble(),maximumRequestedMs:stats.add(40).readDouble(),deadlineResets:stats.add(48).readDouble(),lastWaitResult:stats.add(56).readDouble()};}
+      let privateField={};if(replicaFieldStatsReader){const stats=Memory.alloc(24);replicaFieldStatsReader(stats);privateField={privateCalls:stats.readDouble(),forwardedCalls:stats.add(8).readDouble(),rejectedCalls:stats.add(16).readDouble()};}
+      if(presentationClockReader){const stats=Memory.alloc(32),ready=presentationClockReader(stats);if(ready===4)lastPresentationClock={localTimeMs:stats.readDouble(),sourceOffsetMs:stats.add(8).readDouble(),motionSourceTimeMs:stats.add(16).readDouble(),visualSourceTimeMs:stats.add(24).readDouble()};else if(ready!==0 && ready!==-7)throw new Error('Native presentation clock stats failed: '+ready);}
+      let healthAudit=null;if(cfg.verifyPilotHealth && lastHealthFrame && realtimeHealthAudit){const stats=Memory.alloc(24);realtimeHealthAudit(zone,lastHealthFrame.health.buffer,lastHealthFrame.health.count,stats);healthAudit={blocksCompared:stats.readDouble(),mismatches:stats.add(8).readDouble(),maximumError:stats.add(16).readDouble()};}
+      if(clusters>=0 && verifiedRoots===world.roots)configureSceneGate(zone);
+      timing('geometryApply',Date.now()-geometryStarted);
       send({type:'world-applied',seq:world.seq,clusters,expectedRoots:world.roots,
         verifiedPath,verifiedRoots,inputSha256:world.sha256,message:worldLoadMessage().readUtf8String(),
         displayFrames,drawCalls,pollCalls,lastView,pilotRenderCalls,replicaPilot,
-        frameTiming:{histogram:frameHistogram,longFrames,maxFrameMs},predictedFrames,presentation,persistentReplica,pilotPointer,campaignMap,
+        frameTiming:{histogram:frameHistogram,longFrames,maxFrameMs},framePacing,privateField,ownership:readOwnershipStats(),localExhaust:readLocalExhaustStats(),replacement:readReplacementStats(),sceneGate:readSceneGateStats(),sceneHandoff:readSceneHandoffStats(),motionAdmission:motionAdmission(),deliveryTiming:deliverySummary(),motionTimeline,simulationPresentationRate:presentationRateReader?presentationRateReader():1,predictedFrames,presentationBusy,presentation,persistentReplica,pilotPointer,campaignMap,motionApplied,prediction,nativeZoneUpdates,nativeHeartbeatCalls,drawThread:nativeDrawThread,swapThread:nativeSwapThread,cameraThread:nativeCameraThread,nativeUpdateThread,healthFrameSeq:lastHealthFrame?lastHealthFrame.seq:0,healthAudit,
+        presentationDelayMs,interpolation,presentationClock:lastPresentationClock,comparisonView:lastComparisonView,visualHistoryResets,visualFrameSeq:lastVisualFrame?lastVisualFrame.seq:0,visualFrameApplications,preparedVisualFrames:preparedVisualFrames.length,
         pilotHealth:cfg.verifyPilotHealth && clusters>=0?pilotHealth(zone):[],runtimeHealth:clusters>=0 && !cfg.skipHealth?runtimeHealth(zone):[]});
     }
     if (poseSetter && pendingState && result >= 1) {
@@ -819,6 +1599,48 @@ if(cfg.renderOnly) {
   // block simulation. The host alone advances authoritative combat state.
   if(load(Memory.allocUtf16String(cfg.dll)).isNull()) throw new Error('Replica DLL load failed');
   const replicaDll=Process.getModuleByName('RepopulatedDiagnostic.dll');
+  installWireHex(replicaDll);
+  if(thrustAuditIdent)configureThrustAudit(replicaDll);
+  if(cfg.measureRendering){
+    const render=game.getExportByName('?render@Block@@QEBAXPEAU?$MeshPair@UVertexPos2ColorTime@@UVertexPosColor@@@@@Z');
+    const original=Interceptor.replaceFast(render,replicaDll.getExportByName('RepopulatedObserveBlockRender'));
+    new NativeFunction(replicaDll.getExportByName('RepopulatedSetBlockRenderOriginal'),'void',['pointer'])(original);
+    blockRenderCounter=new NativeFunction(replicaDll.getExportByName('RepopulatedBlockRenderCalls'),'uint64',[]);
+  }
+  if(cfg.fastMotion){
+    motionBegin=new NativeFunction(replicaDll.getExportByName('RepopulatedBeginMotionFrame'),'void',['uint','float','double','double']);
+    new NativeFunction(replicaDll.getExportByName('RepopulatedConfigurePresentationDelay'),'void',['float'])(presentationDelayMs);
+    visualBegin=new NativeFunction(replicaDll.getExportByName('RepopulatedBeginVisualFrame'),'void',['double']);
+    viewSourceTimeReader=new NativeFunction(replicaDll.getExportByName('RepopulatedViewSourceTime'),'double',[]);
+    interpolationStatsReader=new NativeFunction(replicaDll.getExportByName('RepopulatedInterpolationStats'),'void',['pointer']);
+    presentationClockReader=new NativeFunction(replicaDll.getExportByName('RepopulatedPresentationClockStats'),'int',['pointer']);
+    motionTimelineStats=new NativeFunction(replicaDll.getExportByName('RepopulatedMotionTimelineStats'),'void',['pointer']);
+    presentationRateReader=new NativeFunction(replicaDll.getExportByName('RepopulatedSimulationPresentationRate'),'double',[]);
+    presentationGuardStats=new NativeFunction(replicaDll.getExportByName('RepopulatedPresentationGuardStats'),'void',['pointer']);
+    const pacingStatsExport=replicaDll.findExportByName('RepopulatedNativePaceStats');
+    if(pacingStatsExport)framePaceStatsReader=new NativeFunction(pacingStatsExport,'void',['pointer']);
+    const exhaustStatsExport=replicaDll.findExportByName('RepopulatedLocalExhaustStats');
+    if(exhaustStatsExport){localExhaustStatsReader=new NativeFunction(exhaustStatsExport,'void',['pointer']);localExhaustStatsBuffer=Memory.alloc(5*8);}
+    motionApply=new NativeFunction(replicaDll.getExportByName('RepopulatedApplyMotionFrame'),'int',['pointer','pointer','int']);
+    const motionMessageExport=replicaDll.findExportByName('RepopulatedMotionApplyMessage');
+    if(motionMessageExport)motionApplyMessage=new NativeFunction(motionMessageExport,'pointer',[]);
+    realtimeVisualApply=new NativeFunction(replicaDll.getExportByName('RepopulatedApplyRealtimePresentation'),'int',['pointer','pointer','int','pointer','int','pointer','int']);
+    realtimeHealthApply=new NativeFunction(replicaDll.getExportByName('RepopulatedApplyRealtimeHealth'),'int',['pointer','pointer','int']);
+    realtimeHealthAudit=new NativeFunction(replicaDll.getExportByName('RepopulatedAuditRealtimeHealth'),'void',['pointer','pointer','int','pointer']);
+    realtimeMoversApply=new NativeFunction(replicaDll.getExportByName('RepopulatedApplyMovers'),'int',['pointer','int']);
+    if(cfg.nativeCampaignClient)realtimeMoverWindowApply=new NativeFunction(replicaDll.getExportByName('RepopulatedApplyMoverWindow'),'int',['pointer','int','double','pointer','int','double']);
+    localMoverCounter=new NativeFunction(replicaDll.getExportByName('RepopulatedLocalMoverUpdates'),'uint64',[]);
+    if(cfg.predictPilot){
+      new NativeFunction(replicaDll.getExportByName('RepopulatedEnablePrediction'),'void',['bool'])(1);
+      predictionTick=new NativeFunction(replicaDll.getExportByName('RepopulatedPredictionTick'),'uint',[]);
+      predictionAck=new NativeFunction(replicaDll.getExportByName('RepopulatedPredictionAck'),'void',['uint','uint']);
+      predictionStats=new NativeFunction(replicaDll.getExportByName('RepopulatedPredictionStats'),'void',['pointer']);
+    }
+    const effect=game.base.add(0x1cc440),prefix=[0x48,0x8b,0xc4,0x48,0x89,0x58,0x08,0x55,0x48,0x8d,0x68,0xc1];
+    const actual=new Uint8Array(effect.readByteArray(prefix.length));if(prefix.some((b,i)=>actual[i]!==b))throw new Error('Local native exhaust signature differs');
+    const original=Interceptor.replaceFast(effect,replicaDll.getExportByName('RepopulatedLocalThrust'));
+    new NativeFunction(replicaDll.getExportByName('RepopulatedSetThrustOriginal'),'void',['pointer'])(original);
+  }
   if(cfg.predictPresentation) replicaPresenter=new NativeFunction(replicaDll.getExportByName('RepopulatedPresentReplica'),'int',['pointer','float','uint','pointer']);
   if(cfg.replicatePresentation) {
     visualApply=new NativeFunction(replicaDll.getExportByName('RepopulatedApplyPresentation'),'int',['pointer','pointer','int','pointer','int','pointer','int']);
@@ -837,13 +1659,37 @@ if(cfg.renderOnly) {
   Interceptor.replace(game.getExportByName('?update@Block@@QEAA_NI@Z'),replicaDll.getExportByName('RepopulatedReplicaBlockUpdate'));
   Interceptor.replace(game.getExportByName('?update@AI@@QEAAX_N@Z'),replicaDll.getExportByName('RepopulatedReplicaAIUpdate'));
 }
+function consumeMotion(zone,opportunity='update'){
+    if(pendingMotion && campaignReplicaZone && !zone.equals(campaignReplicaZone))streamStats.zoneSkips++;
+    if(!motionApply || !replicaInitialized || (campaignReplicaZone && !zone.equals(campaignReplicaZone)) || (!pendingMotion && !lastMotion))return;
+    if(sceneGateReady && !pendingMotion){
+      const frame=currentVisualFrame();
+      if(!frame || (lastVisualFrame && frame.seq===lastVisualFrame.seq))return;
+    }
+    const sceneToken=trySceneUpdate(zone);if(sceneToken===0){noteMotionDeferred(zone,opportunity);return;}
+    let started=0;
+    let sceneCommitted=false;
+    try{
+    if(pendingMotion){
+      started=Date.now();
+      const frame=pendingMotion;pendingMotion=null;pendingMotionQueuedSince=0;applyMotionFrame(zone,frame);lastMotion=frame;
+    }
+    consumeVisualFrame(zone);
+    sceneCommitted=true;
+    }finally{endSceneUpdate(zone,sceneToken,sceneCommitted);}
+    if(started){const elapsed=Date.now()-started;timing('motionApply',elapsed);streamStats.maxApplyMs=Math.max(streamStats.maxApplyMs,elapsed);}
+}
 function beforeZoneUpdate(zone) {
+    nativeZoneUpdates++;
     if(campaignAuthorityEnded)return;
     if(cfg.campaignRemote && campaignAuthorityZone && !zone.equals(campaignAuthorityZone))return;
     if(cfg.keepHostRunningInMenus)hostUpdateThread=Process.getCurrentThreadId();
-    if ((cfg.networkControl || cfg.replica) && !cfg.frameLimit) Thread.sleep(1/60);
+    // The native campaign already paces physics. An added sleep here halved
+    // its simulation clock while the independent renderer kept running.
+    if ((cfg.networkControl || cfg.replica) && !cfg.frameLimit && !cfg.campaignRemote) Thread.sleep(1/60);
     if(cfg.nativeCampaignClient && campaignReplicaZone && zone.equals(campaignReplicaZone))nativeUpdateThread=Process.getCurrentThreadId();
     if(cfg.nativeCampaignClient && campaignReplicaZone && zone.equals(campaignReplicaZone)){campaignConsole.add(8).writePointer(zone);consoleContext=campaignConsole;}
+    consumeMotion(zone,'entry');
     if(cfg.directControl) dispatchControls(zone);
     if(driver) for(const state of driveStates.values()) {
       const stale=Date.now()-state.received>500;
@@ -855,6 +1701,8 @@ function beforeZoneUpdate(zone) {
 function afterZoneUpdate(zone) {
     if(campaignAuthorityEnded)return;
     if(cfg.campaignRemote && campaignAuthorityZone && !zone.equals(campaignAuthorityZone))return;
+    reportHostAIStats();
+    reportHostOwnershipStats();
     if(pendingCheckpoint) {
       const request=pendingCheckpoint;pendingCheckpoint=null;
       ensureSceneIdentities(zone);
@@ -868,6 +1716,31 @@ function afterZoneUpdate(zone) {
       if(files>=3 && cfg.syncCampaignMap && campaignMapRemoteExporter(zone,Memory.allocUtf8String(request.path+'/remote-map.json'))<0)throw new Error('Checkpoint remote exploration export failed');
       send({type:'checkpoint-complete',id:request.id,path:request.path,files,roots,playerHealth:files>=3 && roots===2?playerHealth(zone):[]});
     }
+    if(cfg.streamMotion && loaded && Date.now()-lastMotionExport>=50){
+      const exportStarted=Date.now();
+      if(lastMotionSampled)timing('exportInterval',exportStarted-lastMotionSampled);lastMotionSampled=exportStarted;
+      lastMotionExport=exportStarted;
+      if(!motionRead){motionRead=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedReadMotion'),'int',['pointer','uint','float','pointer','int']);motionBuffer=Memory.alloc(4096*44);}
+      if(!monotonicClock)monotonicClock=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedMonotonicMillis'),'double',[]);
+      let exportStage=Date.now();
+      const radius=Math.min(20000,clientViewRadius+1500),sourceTimeMs=Math.floor(monotonicClock()),simTimeMs=Math.round(zone.add(0x158).readFloat()*1000);
+      const count=motionRead(zone,cfg.interestIdent,radius,motionBuffer,4096);
+      timing('motionRead',Date.now()-exportStage);exportStage=Date.now();
+      if(count<0)throw new Error('Native motion export failed: '+count);
+      if(count){
+        if(!realtimeRead){realtimeRead=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedReadRealtime'),'int',['pointer','uint','float','pointer']);realtimeBuffer=Memory.alloc(16+4096*56+2048*36+4096*16+65536*16);}
+        const state=realtimeRead(zone,cfg.interestIdent,radius,realtimeBuffer);if(state<0)throw new Error('Native realtime export failed: '+state);
+        timing('realtimeRead',Date.now()-exportStage);exportStage=Date.now();
+        const packed={};let offset=16;
+        [['blocks',56,4096],['projectiles',36,2048],['movers',16,4096],['health',16,65536]].forEach(([key,size,limit],i)=>{const n=realtimeBuffer.add(i*4).readU32();if(n>limit)throw new Error('Realtime export bounds');packed[key]=hexBuffer(realtimeBuffer.add(offset),n*size);offset+=size*limit;});
+        const poses=hexBuffer(motionBuffer,count*44);timing('motionEncode',Date.now()-exportStage);
+        timing('motionExport',Date.now()-exportStarted);
+        send({type:'native-motion',seq:++motionSequence,sourceTimeMs,simTimeMs,poses,inputSeq:latestInputSequence,inputTick:latestInputTick,...packed,deliveryTiming:deliverySummary(),nativeThreads:{update:hostUpdateThread,draw:nativeDrawThread,swap:nativeSwapThread},hostFrameTiming:{histogram:frameHistogram,longFrames,maxFrameMs}});
+      }
+    }
+    // Entry can coincide with rendering for several updates. The private
+    // fixture also tries its nonblocking idle slot after native Update returns.
+    if(sceneGateReady && cfg.nativeCampaignClient && replicaInitialized && campaignReplicaZone && zone.equals(campaignReplicaZone))consumeMotion(zone,'exit');
     sample(zone);
     if(cfg.pilotInput && !cfg.nativeCampaignClient && Date.now()-lastPilotInput>=100) {
       lastPilotInput=Date.now();
@@ -903,7 +1776,13 @@ if(cfg.directControl && !cfg.replica && !cfg.fireTest) {
             const state=fireStates.get(faction);
             if(state && fire) {
               if(state.action==='native'){
+                const now=Date.now();
+                state.weapons.forEach((row,i)=>{
+                  const pulse=nativeWeaponPulses.get(row[0]);
+                  state.nativeWeaponBuffer.add(i*32+4).writeU32((row[1]|(pulse && now-pulse.received<=500?pulse.mask:0))>>>0);
+                });
                 const result=nativeWeapons(cluster.add(8).readPointer(),faction,pilot,state.nativeWeaponBuffer,state.weapons.length,Number(Date.now()-state.received>500));
+                nativeWeaponPulses.clear();
                 if(result<0)throw new Error('Native weapon intent rejected: '+result);
                 if(state.report){send({type:'network-fire-result',seq:state.seq,result});state.report=false;}
                 return;
@@ -919,11 +1798,47 @@ if(cfg.directControl && !cfg.replica && !cfg.fireTest) {
         }
       }
     }
-    aiForward(ai,force);vanillaCalls++;
-    if(vanillaCalls===300) send({type:'vanilla-ai-preserved',calls:vanillaCalls});
+    aiForward(ai,force);vanillaCalls++;hostAIOriginalCalls++;
+    if(!hostAIStatsReader && vanillaCalls===300) send({type:'vanilla-ai-preserved',calls:vanillaCalls});
   },'void',['pointer','bool']);
-  const original=Interceptor.replaceFast(game.getExportByName('?update@AI@@QEAAX_N@Z'),aiOverride);
+  let replacement=aiOverride,configure=null,ownedRows=null,entryPrefix=null;
+  const aiTarget=game.getExportByName('?update@AI@@QEAAX_N@Z');
+  if(cfg.campaignRemote){
+    const expected=[0x40,0x53,0x55,0x48,0x83,0xec,0x28,0x4c,0x8b,0x81,0x78,0x02,0,0,0x0f,0xb6,0xea];
+    const actual=new Uint8Array(aiTarget.readByteArray(expected.length));
+    if(expected.some((byte,i)=>actual[i]!==byte))throw new Error('Native host AI entry signature differs');
+    entryPrefix=Array.from(actual,b=>b.toString(16).padStart(2,'0')).join('');
+    if(load(Memory.allocUtf16String(cfg.dll)).isNull())throw new Error('Native AI filter DLL load failed');
+    const dll=Process.getModuleByName('RepopulatedDiagnostic.dll'),factions=Array.from(owned);
+    if(!factions.length || factions.length>16 || factions.some(f=>!Number.isInteger(f)||f<=0||f>0x7fffffff))throw new Error('Invalid native AI ownership');
+    ownedRows=Memory.alloc(factions.length*8);
+    factions.forEach((f,i)=>{
+      const pilot=(cfg.activeShips || {})[f] || 0;
+      if(!Number.isInteger(pilot)||pilot<0||pilot>0xffffffff)throw new Error('Invalid native AI pilot identity');
+      ownedRows.add(i*8).writeS32(f);ownedRows.add(i*8+4).writeU32(pilot);
+    });
+    replacement=dll.getExportByName('RepopulatedHostAIUpdate');
+    configure=new NativeFunction(dll.getExportByName('RepopulatedConfigureHostAI'),'int',['pointer','pointer','pointer','int']);
+    hostAIStatsReader=new NativeFunction(dll.getExportByName('RepopulatedReadHostAIStats'),'void',['pointer']);
+    hostAIStatsBuffer=Memory.alloc(32);
+  }
+  const original=Interceptor.replaceFast(aiTarget,replacement);
   aiForward=new NativeFunction(original,'void',['pointer','bool']);
+  if(configure){
+    let originalBytes;try{originalBytes=hexBuffer(original,64);}catch(error){originalBytes='unreadable: '+error.message;}
+    send({type:'native-ai-prefilter-trampoline',entry:aiTarget.toString(),entryPrefix,original:original.toString(),originalBytes});
+    try{
+      // C retains a raw address; keep the NativeCallback referenced by the
+      // script's live RPC state rather than relying on the C pointer alone.
+      hostAIOwnedCallback=aiOverride;
+      const configured=configure(original,hostAIOwnedCallback,ownedRows,owned.size);
+      if(configured<0)throw new Error('Native AI filter configuration failed: '+configured);
+    }catch(error){
+      Interceptor.revert(aiTarget);hostAIStatsReader=null;hostAIOwnedCallback=null;
+      send({type:'native-ai-prefilter-reverted',reason:error.message});throw error;
+    }
+    send({type:'native-ai-prefilter-installed',ownedFactions:Array.from(owned),activeShips:cfg.activeShips || {}});
+  }
 }
 else if (!cfg.renderOnly && (cfg.replica || cfg.fireTest)) Interceptor.replace(game.getExportByName('?update@AI@@QEAAX_N@Z'), new NativeCallback(() => {}, 'void', ['pointer','bool']));
 else if(!cfg.renderOnly) Interceptor.attach(game.getExportByName('?update@AI@@QEAAX_N@Z'), {
@@ -994,7 +1909,7 @@ if(cfg.trackPlayer) {
     }
   });
   let playerCalls=0;
-  let lastNativeIntent=0;
+  let lastIntentSentAt=0;
   // replaceFast owns this entry on a host that keeps simulation running in
   // overlays. Frida cannot also attach to that replaced entry. Native client
   // intent capture remains attached to its unchanged Player routine.
@@ -1010,33 +1925,54 @@ if(cfg.trackPlayer) {
       }
     },
     onLeave() {
-      if(cfg.captureNativeIntent && Date.now()-lastNativeIntent>=100) {
-        lastNativeIntent=Date.now();const ai=this.ai;
+      if((cfg.testLocalPrediction || cfg.testSmoothFlight) && replicaInitialized){
+        if(!predictionTestAt)predictionTestAt=Date.now();
+        if(!predictionTestDriver)predictionTestDriver=new NativeFunction(Process.getModuleByName('RepopulatedDiagnostic.dll').getExportByName('RepopulatedDriveNative'),'int',['pointer','int','uint','uint','pointer','pointer','bool']);
+        const destination=Memory.alloc(24),precision=Memory.alloc(16);
+        let desired=[0,0,Date.now()-predictionTestAt<4000?200:0,0,0,0];
+        if(cfg.testSmoothFlight){
+          if(!smoothFlightStarted)smoothFlightStarted=Date.now();
+          const elapsed=(Date.now()-smoothFlightStarted)/1000,cycle=Math.floor(elapsed/20),phaseTime=elapsed%20;
+          const phase=phaseTime<8?'forward':phaseTime<16?'turn':'brake';
+          const heading=cycle*Math.PI/2+(phase==='forward'?0:phase==='turn'?(phaseTime-8)*Math.PI/16:Math.PI/2);
+          const speed=phase==='brake'?200*Math.pow(Math.max(0,1-(phaseTime-16)/3),2):200;
+          desired=[0,0,Math.cos(heading)*speed,Math.sin(heading)*speed,Math.atan2(Math.sin(heading),Math.cos(heading)),0];
+          if(phase!==smoothFlightPhase || cycle!==smoothFlightCycle){
+            smoothFlightPhase=phase;smoothFlightCycle=cycle;
+            send({type:'flight-fixture-phase',phase,cycle,elapsedSeconds:elapsed,phaseSeconds:phaseTime});
+          }
+        }
+        desired.forEach((v,i)=>destination.add(i*4).writeFloat(v));
+        [10,10,0.01,0.01].forEach((v,i)=>precision.add(i*4).writeFloat(v));
+        const zone=this.ai.add(0x228).readPointer();
+        const driven=predictionTestDriver(zone,20008,cfg.followPilot,0x106,destination,precision,0);
+        if(driven!==1)throw new Error('Native prediction fixture drive failed: '+driven);
+      }
+      if(cfg.captureNativeIntent && Date.now()-lastIntentSentAt>=33) {
+        lastIntentSentAt=Date.now();const ai=this.ai;
         const command=ai.add(0x278).readPointer(),cluster=command.add(0xb8).readPointer();
         const destination=Array.from({length:6},(_,i)=>ai.add(0x2bc+i*4).readFloat());
         const precision=Array.from({length:4},(_,i)=>ai.add(0x2a8+i*4).readFloat());
-        const weapons=[],weaponFeatures=[];
+        let weapons=[],weaponFeatures=[];
         if(cfg.nativeCampaignClient){
           destination[0]-=cluster.add(0x30).readDouble();destination[1]-=cluster.add(0x38).readDouble();
-          const begin=cluster.add(0xf0).readPointer(),end=cluster.add(0xf8).readPointer(),count=end.sub(begin).toInt32()/8;
-          if(count<0 || count>4096)throw new Error('Native control block limit');
-          for(let i=0;i<count;i++){
-            const block=begin.add(i*8).readPointer(),features=block.add(0x40).readU64().and(uint64('0x800008e0')).toNumber();
-            if(!features)continue;
-            const id=block.add(0x30).readU32(),enabled=block.add(0x100).readU64().and(uint64('0x800008e0')).toNumber();
-            const target=nativeWeaponTargets.get(id);
-            weapons.push([id,target?enabled:0,...(target || [0,0,0,0,0])]);
-            weaponFeatures.push(features);
-          }
-          if(weapons.length>256)throw new Error('Native weapon control limit');
+          weapons=cfg.testSmoothFlight?nativeManualWeapons.map(row=>[row[0],0,...row.slice(2)]):nativeManualWeapons;weaponFeatures=nativeManualFeatures;
           const alive=new Set(weapons.map(row=>row[0]));for(const id of nativeWeaponTargets.keys())if(!alive.has(id))nativeWeaponTargets.delete(id);
         }
-        sendNativeIntent({type:'native-navigation-intent',ident:clusterIdent(cluster),dimensions:ai.add(0x2b8).readU32(),destination,precision,weapons,weaponFeatures,
+        let viewRadius=5000;
+        if(lastView && lastView[3]>0){
+          const width=lastView[2]*lastView[8]-(lastView[2]/lastView[3])*lastView[9],height=lastView[3]*lastView[8]-lastView[9];
+          viewRadius=Math.min(18500,Math.max(1000,Math.hypot(width,height)*0.6));
+        }
+        sendNativeIntent({type:'native-navigation-intent',ident:clusterIdent(cluster),dimensions:ai.add(0x2b8).readU32(),destination,precision,weapons,weaponFeatures,viewRadius,clientTick:predictionTick?predictionTick():0,
+              flightFixture:cfg.testSmoothFlight?{phase:smoothFlightPhase,cycle:smoothFlightCycle,elapsedSeconds:smoothFlightStarted?(Date.now()-smoothFlightStarted)/1000:0}:null,
               vx:ai.add(0x2c4).readFloat(),vy:ai.add(0x2c8).readFloat(),angle:ai.add(0x2cc).readFloat()});
       }
     }
   });
 }
+if(cfg.replica)setInterval(()=>send({type:'native-progress',displayFrames,nativeZoneUpdates,motionApplied,
+                                    stages:Array.from(nativeLastStages.values())}),1000);
 '''
 
 

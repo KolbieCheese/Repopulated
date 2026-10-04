@@ -21,7 +21,7 @@ class Launcher:
     BG='#171c24'; PANEL='#222a35'; TEXT='#e8e9e6'; MUTED='#a1abb9'; GOLD='#d3b66c'
     def __init__(self,root):
         import launch
-        self.backend=launch;self.root=root;self.process=None;self.log_handle=None;self.test_session=False;self.last_exit=None
+        self.backend=launch;self.root=root;self.process=None;self.log_handle=None;self.test_session=False;self.test_steam=False;self.last_exit=None
         self.settings=json.loads((ROOT/'settings.json').read_text())
         preferences=ROOT/'launcher-settings.json'
         self.preferences=json.loads(preferences.read_text()) if preferences.exists() else {}
@@ -150,6 +150,7 @@ class Launcher:
         atomic_json(ROOT/'launcher-settings.json',{'gamePath':self.game.get()})
         args=([sys.executable,'--backend'] if getattr(sys,'frozen',False) else [sys.executable,str(ROOT/'launch.py')])+['--background','--exe',self.game.get()]
         if self.test_session:args+=['--test','--no-provenance']
+        if self.test_steam:args+=['--steam-test']
         self.log_handle=open(ROOT/'session.log','w',encoding='utf-8')
         self.process=subprocess.Popen(args,cwd=ROOT,stdout=self.log_handle,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW)
         self.play.configure(state='disabled',text='GAME RUNNING');self.status.set('Launching Reassembly…')
@@ -157,7 +158,10 @@ class Launcher:
     def poll(self):
         if self.process is not None:
             code=self.process.poll()
-            if code is None:self.status.set('Reassembly is running with Build Menu Filters. Exit the game normally to save.')
+            if code is None:
+                log=ROOT/'session.log'
+                started=log.exists() and '"type": "game-ready"' in log.read_text(encoding='utf-8',errors='replace')
+                self.status.set('Reassembly is running with Build Menu Filters. Exit the game normally to save.' if started else 'Launching Reassembly; waiting for Steam and game initialization…')
             else:
                 self.last_exit=code
                 self.process=None
@@ -185,7 +189,8 @@ def main():
             import traceback
             traceback.print_exc();raise SystemExit(1)
         return
-    parser=argparse.ArgumentParser();parser.add_argument('--preview',type=Path);parser.add_argument('--self-test',type=Path);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--preview',type=Path);parser.add_argument('--self-test',type=Path);parser.add_argument('--steam-test',action='store_true');args=parser.parse_args()
+    if args.steam_test and not args.self_test:parser.error('--steam-test requires --self-test')
     if os.name=='nt':
         import ctypes
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -203,6 +208,7 @@ def main():
     if args.self_test:
         original=(ROOT/'settings.json').read_text()
         app.test_session=True
+        app.test_steam=args.steam_test
         def begin_test():
             saved_game=app.game.get();app.game.set(str(ROOT/'missing-game.exe'));assert not app.validate()
             app.game.set(saved_game);assert app.validate()
@@ -215,12 +221,12 @@ def main():
             if app.process is not None:root.after(500,finish_test);return
             import ctypes
             report={'guiPlayExit':app.last_exit,'consoleWindow':int(ctypes.windll.kernel32.GetConsoleWindow() or 0),
-                    'settingsSaveAndReset':True,'badExecutableRejected':True}
+                    'settingsSaveAndReset':True,'badExecutableRejected':True,'steamStartupTest':app.test_steam}
             (ROOT/'settings.json').write_text(original)
             args.self_test.write_text(json.dumps(report,indent=2))
-            assert app.last_exit==0
-            if getattr(sys,'frozen',False):assert report['consoleWindow']==0
             root.destroy()
+            if app.last_exit!=0:raise SystemExit(1)
+            if getattr(sys,'frozen',False) and report['consoleWindow']!=0:raise SystemExit(1)
         root.after(300,begin_test)
     root.mainloop()
 

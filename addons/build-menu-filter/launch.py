@@ -82,10 +82,12 @@ def main():
     parser.add_argument('--no-provenance',action='store_true',help='Use ordinary faction metadata only, without optional add-on provenance')
     parser.add_argument('--background',action='store_true',help='Console-free graphical-launcher backend')
     parser.add_argument('--test',action='store_true',help='Fresh profile, hidden window, disabled Steam/network, bounded automated checks')
+    parser.add_argument('--steam-test',action='store_true',help='With --test: real Steam and an early-stats regression; Cloud disabled in private profile')
     parser.add_argument('--addon-test',action='store_true',help='Test the installed expanded faction in the isolated profile')
     args=parser.parse_args()
     if args.exe is None:parser.error('Reassembly not found; pass --exe with the Windows x64 executable path')
     if args.addon_test and not args.test:parser.error('--addon-test requires --test')
+    if args.steam_test and not args.test:parser.error('--steam-test requires --test')
     exe=args.exe.resolve()
     if hashlib.sha256(exe.read_bytes()).hexdigest()!=KNOWN:raise ValueError('Unsupported Reassembly executable; no hooks installed')
     cfg={'settings':json.loads((ROOT/'settings.json').read_text()),'signatures':json.loads((ROOT/'signatures.json').read_text()),'testing':args.test}
@@ -94,28 +96,29 @@ def main():
     except (OSError,ValueError,KeyError,IndexError) as error:
         print('Optional source-label integration unavailable:',error,flush=True)
         cfg['factionLabels'],cfg['provenance']=labels_and_provenance(exe,False)
-    source=(ROOT/'model.js').read_text()+(ROOT/'runtime.js').read_text().replace('__CONFIG__',json.dumps(cfg))
+    source=(ROOT/'startup.js').read_text()+(ROOT/'model.js').read_text()+(ROOT/'runtime.js').read_text().replace('__CONFIG__',json.dumps(cfg))
     folder=ROOT/'research'/('test-'+str(time.time_ns())) if args.test else None
     env=dict(os.environ);argv=[str(exe)];faction=8
     if args.test:
         from isolation import ISOLATION
         folder.mkdir(parents=True)
         env.update(USERPROFILE=str(folder),APPDATA=str(folder),LOCALAPPDATA=str(folder))
-        source=ISOLATION.replace('cfg','isoCfg').replace('sdl','isoSdl').replace('__CONFIG__',json.dumps({'root':str(folder)}))+source
+        source=ISOLATION.replace('cfg','isoCfg').replace('sdl','isoSdl').replace('__CONFIG__',json.dumps({'root':str(folder),'steamEnabled':args.steam_test,'earlyStats':args.steam_test}))+source
         if args.addon_test:
             addon=Path.home()/'Saved Games/Reassembly/mods/reassembler-expanded'
             target=folder/'Reassembly/mods/reassembler-expanded'
             shutil.copytree(addon,target)
             faction=json.loads((addon/'build-report.json').read_text())['targetFaction']
             (target/'factions.lua').write_text('{'+str(faction)+'={name="Filter Test",playable=2}}')
-        argv+=['kNetworkEnable=0','kHeadlessMode=0','kPauseOnLostFocus=0','kMaximizeWindow=0','kWindowSize={1280,720}',
+        argv+=['kSteamCloudEnable=0','kNetworkEnable=0','kHeadlessMode=0','kPauseOnLostFocus=0','kMaximizeWindow=0','kWindowSize={1280,720}',
                'kSandboxScript='+json.dumps(f'constructor {faction}; echo filter-test')]
-    device=frida.get_local_device();pid=None;messages=[];old=Path.cwd()
+    device=frida.get_local_device();pid=None;messages=[];old=Path.cwd();detached=[]
     try:
         if getattr(sys,'frozen',False):
             import ctypes
             ctypes.windll.kernel32.SetDllDirectoryW(None) # Keep bundled launcher DLLs out of the game's DLL search path.
         os.chdir(exe.parent);pid=device.spawn(argv,env=env,stdio='pipe' if args.test or args.background else 'inherit');session=device.attach(pid)
+        session.on('detached',lambda reason,crash:detached.append((reason,crash)))
         script=session.create_script(source)
         def message(raw,data):
             row=raw.get('payload',raw);messages.append(row);print(json.dumps(row),flush=True)
@@ -125,9 +128,31 @@ def main():
                 from PIL import Image
                 image=Image.frombytes('RGBA',(row['width'],row['height']),data)
                 image.transpose(Image.Transpose.FLIP_TOP_BOTTOM).save(folder/(row['name']+'.png'))
-        script.on('message',message);script.load();device.resume(pid)
+        script.on('message',message);script.load()
+        if any(isinstance(m,dict) and m.get('type')=='error' for m in messages):
+            raise RuntimeError('Extension startup failed; see the error above. The game was not resumed.')
+        device.resume(pid)
         if args.test:
-            time.sleep(3)
+            deadline=time.monotonic()+30
+            while time.monotonic()<deadline:
+                status=script.exports_sync.status()
+                if status['active'] and status['frames']>0:break
+                time.sleep(.1)
+            else:raise RuntimeError('Test builder did not become ready')
+            def settle():
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    current=script.exports_sync.status()
+                    if not current['pending']:return current
+                    time.sleep(.05)
+                raise RuntimeError('Game did not apply the pending palette update')
+            if args.steam_test:
+                assert any(m.get('type')=='steam-startup-waiting' for m in messages if isinstance(m,dict))
+                assert any(m.get('type')=='steam-startup-ready' and m['deferredCallbacks']>0 for m in messages if isinstance(m,dict))
+                assert any(m.get('type')=='early-stats-request' and m['ok'] for m in messages if isinstance(m,dict))
+                steam=script.exports_sync.steamstatus()
+                assert steam['initialized'] and steam['callbacksReady']
+                print('STEAM_READ_ONLY',json.dumps(steam),flush=True)
             def sendevent(value):
                 if 'x' in value and value['x']<1200:
                     g=script.exports_sync.status()['geometry']
@@ -139,7 +164,7 @@ def main():
                 {'category':'Thrusters','source':'All','query':''},
                 {'category':'All','source':'All','query':'this-part-does-not-exist'},
                 {'category':'All','source':'All','query':''}]:
-                script.exports_sync.setfilter(value);time.sleep(.4)
+                script.exports_sync.setfilter(value);settle()
             status=script.exports_sync.status();print('STATUS',json.dumps(status),flush=True)
             assert status['frames']>0 and status['failures']==0 and status['shown']==status['total'] and status['total']>0
             checks=[m for m in messages if isinstance(m,dict) and m.get('type')=='filter-applied']
@@ -150,7 +175,7 @@ def main():
             metrics=['mass','health','cost','area','generation','powerStorage','resources','thrust','shieldHealth','dps','range','buildTime']
             for metric in metrics:
                 for direction in ('asc','desc'):
-                    script.exports_sync.setsort({'metric':metric,'direction':direction});time.sleep(.12)
+                    script.exports_sync.setsort({'metric':metric,'direction':direction});settle()
                     items=script.exports_sync.testitems();values=[b['stats'][metric] for b in items]
                     known=[v for v in values if v is not None]
                     assert known==sorted(known,reverse=direction=='desc'), (metric,direction,known)
@@ -164,7 +189,7 @@ def main():
                 assert vault['mass']==1280 and vault['health']==12800 and vault['resources']==30000
             for filtered_category,filtered_metric in [('Weapons','dps'),('Reactors','generation')]:
                 script.exports_sync.setfilter({'category':filtered_category,'source':'All','query':''})
-                script.exports_sync.setsort({'metric':filtered_metric,'direction':'desc'});time.sleep(.2)
+                script.exports_sync.setsort({'metric':filtered_metric,'direction':'desc'});settle()
                 subset=script.exports_sync.testitems()
                 assert 0<len(subset)<status['total'] and all(filtered_category in b['categories'] for b in subset)
                 values=[b['stats'][filtered_metric] for b in subset if b['stats'][filtered_metric] is not None]
@@ -260,11 +285,21 @@ def main():
             print('LIFECYCLE',json.dumps(returned),flush=True)
             print('PASS: toolbar, filters, all numeric sorts both directions, missing values last, SDL keyboard/mouse, toggle, Edit Palette, original IDs unchanged')
         else:
-            print('Filter extension is running. Close Reassembly to finish. Ctrl+C stops this launcher and its game.',flush=True)
+            print('Launching Reassembly; waiting for Steam and game initialization…',flush=True)
+            ready=False
             while True:
-                time.sleep(1)
+                time.sleep(.25)
+                if any(isinstance(m,dict) and m.get('type')=='steam-initialized' and not m['ok'] for m in messages):
+                    raise RuntimeError('Steam could not initialize. Start Steam and sign in, then launch again. The launcher stopped before opening an empty local save list.')
+                if not ready and any(isinstance(m,dict) and m.get('type')=='steam-startup-ready' for m in messages):
+                    ready=True
+                    print(json.dumps({'type':'game-ready'}),flush=True)
+                    print('Reassembly started with Steam enabled. Filters appear in the builder. Close the game normally to save.',flush=True)
                 try:script.exports_sync.status()
-                except (frida.InvalidOperationError,frida.TransportError):break
+                except (frida.InvalidOperationError,frida.TransportError):
+                    if not ready:raise RuntimeError('Reassembly exited before finishing startup. Check its latest crash log and session.log.')
+                    if any(crash for _,crash in detached):raise RuntimeError('Reassembly crashed. Check its latest crash log and session.log.')
+                    break
     except KeyboardInterrupt:
         pass
     finally:

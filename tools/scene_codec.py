@@ -13,15 +13,15 @@ class Reader:
         text=data.decode('utf-8')
         self.tokens=[]
         position=0
-        while position<len(text):
-            match=TOKEN.match(text,position)
-            if not match:
-                if not text[position:].strip():
-                    break
+        for match in TOKEN.finditer(text):
+            if match.start()!=position:
                 raise ValueError('Unsupported snapshot token')
             self.tokens.append(match[1]); position=match.end()
-            if len(self.tokens)>250000:
+            # A valid 1 MiB native scene with embedded fleet blueprints can
+            # exceed 250k tokens. The byte/depth/entity limits remain bounded.
+            if len(self.tokens)>750000:
                 raise ValueError('Snapshot token limit')
+        if text[position:].strip():raise ValueError('Unsupported snapshot token')
         self.index=0
 
     def peek(self,distance=0):
@@ -57,14 +57,17 @@ class Reader:
             return {'fields':fields,'items':items}
         if token.startswith('"'):
             return json.loads(token)
-        if re.fullmatch(r'-?0x[\da-fA-F]+',token):
+        # The lexer has already validated numeric/identifier syntax. Repeating
+        # two regular expressions for every native numeric value dominates
+        # large scene decoding and delays the realtime transport threads.
+        if token.startswith(('0x','-0x')):
             return int(token,16)
-        if re.fullmatch(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?',token):
+        if token[0].isdigit() or token[0] in '-.':
             number=float(token)
             if not math.isfinite(number):
                 raise ValueError('Nonfinite snapshot number')
             return number
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z_\d]*',token):
+        if not (token[0].isalpha() or token[0]=='_'):
             raise ValueError('Unexpected snapshot value')
         parts=[token]
         while self.peek()=='|':

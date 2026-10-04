@@ -174,6 +174,17 @@ def main():
             if result['failures'] or host.failures or result['updates']<3:raise RuntimeError('Packaged native test failed')
             if any(result['presentation'].get(key,0)<10 for key in ('thrustEmissions','projectileDraws','turretsApplied')):
                 raise RuntimeError('Packaged native presentation test failed')
+            gate=result.get('sceneGate',{});threads=result.get('nativeThreads',{});pacing=result.get('framePacing',{})
+            if not result.get('sceneIdleGate') or gate.get('transactions',0)<3 or gate.get('timeouts',0):
+                raise RuntimeError('Packaged native scene synchronization did not advance safely')
+            if (result.get('motionFramesApplied',0)<10 or not threads.get('nativeUpdateThread') or
+                not threads.get('drawThread') or threads['drawThread']==threads['nativeUpdateThread']):
+                raise RuntimeError('Packaged native motion or thread ownership check failed')
+            if pacing.get('failures',0) or pacing.get('maximumRequestedMs',0)>25:
+                raise RuntimeError('Packaged native frame pacing check failed')
+            if ('requests' not in result.get('sceneHandoff',{}) or
+                'longestActivePendingAgeMs' not in result.get('motionAdmission',{})):
+                raise RuntimeError('Packaged native handoff DLL and admission diagnostics are incomplete')
             args.report.write_text(json.dumps(result,indent=2))
         except Exception as error:
             args.report.write_text(json.dumps({'error':str(error)}));raise
@@ -188,4 +199,7 @@ def main():
     else:root.mainloop()
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
+    main()

@@ -42,13 +42,17 @@ def main():
         'Share the host LAN address, game port and generated join token.\n'
         'Leave Native campaign controls and HUD enabled on Join. Choose the initial rotation mode.\n'
         'Both games use native Player controls; the host decides movement, firing, damage and spawning.\n'
-        'The client retains unchanged ships, smooths corrections and predicts linear/angular presentation.\n'
-        'Native client visuals include thruster particles, projectile trails, turret rotation and beams.\n'
+        'The client retains unchanged ships and interpolates motion on a source-time buffer.\n'
+        'The 100 ms presentation buffer smooths arrivals and adds visible control delay.\n'
+        'Immediate local input replay remains experimental and disabled.\n'
+        'The client generates native exhaust locally from thruster controls.\n'
+        'Movement, weapons, projectiles and damage share a frequent state stream; geometry is separate.\n'
+        'Native client visuals include projectile trails, turret rotation and beams.\n'
         'The native map receives authoritative faction colours and discovered station/objective markers.\n'
         'Exploration is separate by default. Hosts can check Share exploration between players before hosting.\n'
         'Both discovery records and the sharing setting survive save/resume.\n'
         'Map and Binding overlays keep receiving world updates on both sides.\n'
-        'Update both launchers together; native protocol version 4 rejects older alpha clients.\n'
+        'Update both launchers together; native protocol version 7 rejects older alpha clients.\n'
         'Save current galaxy creates a checkpoint; select it before hosting again to resume.\n'
         'State and test profiles are in %LOCALAPPDATA%\\Repopulated; normal Reassembly saves are untouched.\n'
         'Closing the launcher stops its own game sessions. Direct game TCP port:32916; LAN discovery UDP:32917.\n\n'
@@ -59,12 +63,12 @@ def main():
         'territory scoring and synchronized map navigation remain unfinished.\n'
         'Remote ship editing, complete client menus, faction choice, mods, full remote\n'
         'progression and dedicated campaign servers remain unfinished.\n'
-        'Explosions, impacts, charging glows and shield effects still need replication and visual checks.\n'
+        'Explosions, impacts, charge glows and shields still need event/state triggers and local visual checks.\n'
         'Save/resume currently preserves\n'
         'the host campaign and both faction ships. Two-machine smoothness needs further testing.\n'
         'See source/docs/native-evening-test.md for the playtest steps and known limits.\n'
         'No Reassembly executable or game assets are included. Source and detailed notes are included.\n',encoding='utf-8')
-    for folder,pattern in (('tools','*.py'),('native','*.c'),('docs','native*.md')):
+    for folder,pattern in (('tools','*.py'),('native','*.c'),('native','*.h'),('docs','native*.md')):
         destination=package/'source'/folder;destination.mkdir(parents=True,exist_ok=True)
         for file in (ROOT/folder).glob(pattern):shutil.copyfile(file,destination/file.name)
     release=ROOT/'.runtime'/'releases';release.mkdir(exist_ok=True);archive=release/'Repopulated-Multiplayer-Alpha.zip'
